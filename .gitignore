@@ -1,0 +1,5 @@
+﻿.venv/
+epu.db
+__pycache__/
+*.pyc
+.streamlit/
