@@ -1,12 +1,12 @@
-# EPU Builder v1.2 – Streamlit + SQLite
-# Novità v1.2:
-# - Capitoli: Spese generali (%) e Utile (%) di default a livello capitolo
-# - Voci: precompilano CG%/Utile% dal capitolo ma restano modificabili per singola voce
-# - Voci: aggiunti UM della VOCE e Quantità della VOCE (la “misura prodotta” della voce)
-# - UM estese: Mt, Mtq2, Hr, Nr, Lt, GG, KG, QL, AC
-# - Sommario: mostra anche Quantità Voce e UM Voce
-# - Import Fornitori da CSV (nome obbligatorio + campi anagrafici opzionali)
-# - Mantiene tutte le funzioni di v1.1 (inline edit, clone voce, import materiali, export Excel)
+# EPU Builder v1.3 – Streamlit + SQLite
+# Contiene:
+# - Tabelle categorie, fornitori, materiali, capitoli (con CG%/Utile% default), voci (UM e Q.tà voce), distinte
+# - Inline edit materiali e quantità delle righe distinta
+# - Import materiali (CSV/Excel) e fornitori (CSV/Excel)
+# - Duplicate (clona) voce con distinta
+# - Sommario EPU a livelli (Capitolo -> Voce -> Dettaglio), livello Capitolo SENZA totali
+# - Export Excel del Sommario EPU (solo foglio "Sommario EPU" con anche Nome Capitolo)
+# - Pagina PREVENTIVI: clienti, creazione preventivo, righe da voci, totali capitolo, imponibile+IVA, export Excel, archivio con filtri
 
 import io
 import sqlite3
@@ -19,10 +19,10 @@ import streamlit as st
 DB_PATH = "epu.db"
 UM_CHOICES = ["Mt", "Mtq2", "Hr", "Nr", "Lt", "GG", "KG", "QL", "AC"]
 
-st.set_page_config(page_title="EPU Builder v1.2", layout="wide")
+st.set_page_config(page_title="EPU Builder v1.3", layout="wide")
 
 # ------------------------------------------------------------------
-# DB
+# DB helpers
 # ------------------------------------------------------------------
 def _exec(con, sql, params=None):
     cur = con.cursor()
@@ -65,7 +65,7 @@ def init_db():
             UNIQUE(fornitore_id, codice_fornitore)
         )""")
 
-        # Capitoli: aggiungiamo default per SG% e Utile%
+        # Capitoli con default %SG e %Utile
         cur.execute("""
         CREATE TABLE IF NOT EXISTS capitoli (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,7 +75,7 @@ def init_db():
             utile_default_percentuale REAL DEFAULT 0.0
         )""")
 
-        # Voci: aggiungiamo UM/Quantità VOCE + utile%
+        # Voci di analisi (con UM/Quantità della VOCE)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS voci_analisi (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,9 +100,48 @@ def init_db():
             FOREIGN KEY(voce_analisi_id) REFERENCES voci_analisi(id),
             FOREIGN KEY(materiale_id) REFERENCES materiali_base(id)
         )""")
+
+        # Clienti / Preventivi
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS clienti (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL,
+            piva TEXT, indirizzo TEXT, cap TEXT, citta TEXT, provincia TEXT, nazione TEXT,
+            email TEXT, telefono TEXT, note TEXT
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS preventivi (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            numero TEXT NOT NULL,
+            data TEXT NOT NULL,
+            cliente_id INTEGER NOT NULL,
+            note_finali TEXT,
+            iva_percentuale REAL DEFAULT 22.0,
+            imponibile REAL DEFAULT 0.0,
+            iva_importo REAL DEFAULT 0.0,
+            totale REAL DEFAULT 0.0,
+            FOREIGN KEY(cliente_id) REFERENCES clienti(id)
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS preventivo_righe (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            preventivo_id INTEGER NOT NULL,
+            capitolo_id INTEGER NOT NULL,
+            voce_id INTEGER NOT NULL,
+            descrizione TEXT NOT NULL,
+            note TEXT,
+            um TEXT NOT NULL,
+            quantita REAL NOT NULL,
+            prezzo_unitario REAL NOT NULL,
+            prezzo_totale REAL NOT NULL,
+            FOREIGN KEY(preventivo_id) REFERENCES preventivi(id),
+            FOREIGN KEY(capitolo_id) REFERENCES capitoli(id),
+            FOREIGN KEY(voce_id) REFERENCES voci_analisi(id)
+        )""")
+
         con.commit()
 
-        # Seed categorie e fornitore iniziale
+        # Seed iniziali
         if _exec(con, "SELECT COUNT(*) FROM categorie").fetchone()[0] == 0:
             _exec(con, "INSERT INTO categorie (nome) VALUES (?), (?), (?), (?)",
                   ["Edile", "Ferramenta", "Noleggi", "Pose"])
@@ -127,7 +166,8 @@ def df_categorie():
 
 def df_fornitori():
     with get_con() as con:
-        return pd.read_sql_query("SELECT id, nome, piva, indirizzo, email, telefono FROM fornitori ORDER BY nome", con)
+        return pd.read_sql_query("""SELECT id, nome, piva, indirizzo, email, telefono
+                                    FROM fornitori ORDER BY nome""", con)
 
 def df_materiali():
     with get_con() as con:
@@ -139,15 +179,15 @@ def df_materiali():
                    IFNULL(m.quantita_default,1.0) AS quantita_default,
                    m.prezzo_unitario
             FROM materiali_base m
-            JOIN categorie c ON c.id = m.categoria_id
-            JOIN fornitori f ON f.id = m.fornitore_id
+            JOIN categorie c  ON c.id = m.categoria_id
+            JOIN fornitori f  ON f.id = m.fornitore_id
             ORDER BY c.nome, f.nome, m.codice_fornitore
         """, con)
 
 def df_capitoli():
     with get_con() as con:
         return pd.read_sql_query("""
-            SELECT id, codice, nome, 
+            SELECT id, codice, nome,
                    IFNULL(cg_default_percentuale,0) AS cg_def,
                    IFNULL(utile_default_percentuale,0) AS ut_def
             FROM capitoli ORDER BY codice
@@ -241,47 +281,66 @@ def compute_totali_voce(voce_id: int) -> Dict[str, float]:
         "totale": totale,
     }
 
+def prezzo_unitario_voce(voce_id: int) -> float:
+    v = get_voce(voce_id)
+    if not v:
+        return 0.0
+    tot = compute_totali_voce(voce_id)["totale"]
+    q = max(float(v["q_voce"]), 1e-9)
+    return tot / q
+
 # ------------------------------------------------------------------
-# Mutations
+# Mutations (CRUD)
 # ------------------------------------------------------------------
 def add_categoria(nome: str):
     with get_con() as con:
         try:
             _exec(con, "INSERT INTO categorie (nome) VALUES (?)", (nome.strip(),))
-            con.commit(); st.success("Categoria aggiunta.")
+            con.commit()
+            st.success("Categoria aggiunta.")
         except sqlite3.IntegrityError:
             st.warning("Categoria già esistente.")
 
 def delete_categoria(cid: int):
     with get_con() as con:
         used = _exec(con, "SELECT COUNT(*) FROM materiali_base WHERE categoria_id=?", (cid,)).fetchone()[0]
-        if used: st.warning("Impossibile eliminare: categoria in uso."); return
-        _exec(con, "DELETE FROM categorie WHERE id=?", (cid,)); con.commit(); st.success("Categoria eliminata.")
+        if used:
+            st.warning("Impossibile eliminare: categoria usata da materiali.")
+            return
+        _exec(con, "DELETE FROM categorie WHERE id=?", (cid,))
+        con.commit()
+        st.success("Categoria eliminata.")
 
 def add_fornitore(nome, piva, indirizzo, email, telefono):
     with get_con() as con:
         try:
-            _exec(con, """INSERT INTO fornitori (nome,piva,indirizzo,email,telefono) VALUES (?,?,?,?,?)""",
-                  (nome.strip(), piva, indirizzo, email, telefono))
-            con.commit(); st.success("Fornitore aggiunto.")
+            _exec(con, """INSERT INTO fornitori (nome,piva,indirizzo,email,telefono)
+                          VALUES (?,?,?,?,?)""", (nome.strip(), piva, indirizzo, email, telefono))
+            con.commit()
+            st.success("Fornitore aggiunto.")
         except sqlite3.IntegrityError:
             st.warning("Fornitore già esistente.")
 
 def delete_fornitore(fid: int):
     with get_con() as con:
         used = _exec(con, "SELECT COUNT(*) FROM materiali_base WHERE fornitore_id=?", (fid,)).fetchone()[0]
-        if used: st.warning("Impossibile eliminare: fornitore in uso."); return
-        _exec(con, "DELETE FROM fornitori WHERE id=?", (fid,)); con.commit(); st.success("Fornitore eliminato.")
+        if used:
+            st.warning("Impossibile eliminare: fornitore usato da materiali.")
+            return
+        _exec(con, "DELETE FROM fornitori WHERE id=?", (fid,))
+        con.commit()
+        st.success("Fornitore eliminato.")
 
 def add_materiale(categoria_id, fornitore_id, codice_fornitore, descrizione, um, qdef, prezzo):
     try:
         with get_con() as con:
             _exec(con, """
                 INSERT INTO materiali_base (categoria_id, fornitore_id, codice_fornitore, descrizione, unita_misura, quantita_default, prezzo_unitario)
-                VALUES (?,?,?,?,?,?,?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (int(categoria_id), int(fornitore_id), codice_fornitore.strip(), descrizione.strip(),
                   um, float(qdef or 1.0), float(prezzo)))
-            con.commit(); st.success("Materiale inserito.")
+            con.commit()
+            st.success("Materiale inserito.")
     except sqlite3.IntegrityError:
         st.error("Codice fornitore già presente per questo fornitore.")
 
@@ -291,8 +350,11 @@ def update_materiali_bulk(df_edit: pd.DataFrame, df_orig: pd.DataFrame):
         orig = df_orig[df_orig["id"] == row["id"]].iloc[0]
         fields = ["descrizione", "unita_misura", "quantita_default", "prezzo_unitario"]
         updates = {f: row[f] for f in fields if str(row[f]) != str(orig[f])}
-        if updates: changes.append((int(row["id"]), updates))
-    if not changes: st.info("Nessuna modifica."); return
+        if updates:
+            changes.append((int(row["id"]), updates))
+    if not changes:
+        st.info("Nessuna modifica da salvare.")
+        return
     with get_con() as con:
         for mid, upd in changes:
             sets = ", ".join([f"{k}=?" for k in upd.keys()])
@@ -306,7 +368,8 @@ def add_capitolo(codice, nome, cg_def, ut_def):
         with get_con() as con:
             _exec(con, "INSERT INTO capitoli (codice, nome, cg_default_percentuale, utile_default_percentuale) VALUES (?,?,?,?)",
                   (codice.strip(), nome.strip(), float(cg_def or 0.0), float(ut_def or 0.0)))
-            con.commit(); st.success("Capitolo inserito.")
+            con.commit()
+            st.success("Capitolo inserito.")
     except sqlite3.IntegrityError:
         st.error("Codice capitolo già esistente.")
 
@@ -314,37 +377,51 @@ def update_capitolo_defaults(cid: int, cg_def: float, ut_def: float):
     with get_con() as con:
         _exec(con, "UPDATE capitoli SET cg_default_percentuale=?, utile_default_percentuale=? WHERE id=?",
               (float(cg_def or 0.0), float(ut_def or 0.0), int(cid)))
-        con.commit(); st.success("Default aggiornati (solo nuove voci o voci modificate singolarmente).")
+        con.commit()
+        st.success("Default aggiornati (influenza nuove voci; le esistenti si modificano singolarmente).")
 
 def delete_capitolo(cid: int):
     with get_con() as con:
         used = _exec(con, "SELECT COUNT(*) FROM voci_analisi WHERE capitolo_id=?", (cid,)).fetchone()[0]
-        if used: st.warning("Impossibile eliminare: ha voci collegate."); return
-        _exec(con, "DELETE FROM capitoli WHERE id=?", (cid,)); con.commit(); st.success("Capitolo eliminato.")
+        if used:
+            st.warning("Impossibile eliminare: il capitolo contiene voci.")
+            return
+        _exec(con, "DELETE FROM capitoli WHERE id=?", (cid,))
+        con.commit()
+        st.success("Capitolo eliminato.")
 
 def add_voce(capitolo_id, codice, descrizione, cg_pct, utile_pct, um_voce, q_voce):
     try:
         with get_con() as con:
-            _exec(con, """INSERT INTO voci_analisi 
-                (capitolo_id, codice, descrizione, costi_generali_percentuale, utile_percentuale, voce_unita_misura, voce_quantita)
-                VALUES (?,?,?,?,?,?,?)""",
-                (int(capitolo_id), codice.strip(), descrizione.strip(),
-                 float(cg_pct or 0.0), float(utile_pct or 0.0), um_voce, float(q_voce or 1.0)))
-            con.commit(); st.success("Voce creata.")
+            _exec(con, """INSERT INTO voci_analisi (capitolo_id, codice, descrizione, costi_generali_percentuale, utile_percentuale, voce_unita_misura, voce_quantita)
+                          VALUES (?,?,?,?,?,?,?)""",
+                  (int(capitolo_id), codice.strip(), descrizione.strip(), float(cg_pct or 0.0),
+                   float(utile_pct or 0.0), um_voce, float(q_voce or 1.0)))
+            con.commit()
+            st.success("Voce creata.")
     except sqlite3.IntegrityError:
         st.error("Codice voce già esistente nel capitolo.")
+
+def update_voce_perc(vid: int, cg_pct: float, utile_pct: float):
+    with get_con() as con:
+        _exec(con, "UPDATE voci_analisi SET costi_generali_percentuale=?, utile_percentuale=? WHERE id=?",
+              (float(cg_pct or 0.0), float(utile_pct or 0.0), int(vid)))
+        con.commit()
+        st.success("Percentuali aggiornate.")
 
 def update_voce_perc_umqty(vid: int, cg_pct: float, utile_pct: float, um_voce: str, q_voce: float):
     with get_con() as con:
         _exec(con, "UPDATE voci_analisi SET costi_generali_percentuale=?, utile_percentuale=?, voce_unita_misura=?, voce_quantita=? WHERE id=?",
               (float(cg_pct or 0.0), float(utile_pct or 0.0), um_voce, float(q_voce or 1.0), int(vid)))
-        con.commit(); st.success("Voce aggiornata.")
+        con.commit()
+        st.success("Voce aggiornata.")
 
-def add_riga(voce_id: int, materiale_id: int, quantita: float):
+def add_riga_distinta(voce_id: int, materiale_id: int, quantita: float):
     with get_con() as con:
         _exec(con, "INSERT INTO righe_distinta (voce_analisi_id, materiale_id, quantita) VALUES (?,?,?)",
               (int(voce_id), int(materiale_id), float(quantita)))
-        con.commit(); st.success("Riga aggiunta.")
+        con.commit()
+        st.success("Riga aggiunta.")
 
 def update_quantita_righe(voce_id: int, edited: pd.DataFrame, original: pd.DataFrame):
     diffs = []
@@ -352,54 +429,165 @@ def update_quantita_righe(voce_id: int, edited: pd.DataFrame, original: pd.DataF
         o = original[original["id"] == r["id"]].iloc[0]
         if float(r["quantita"]) != float(o["quantita"]):
             diffs.append((float(r["quantita"]), int(r["id"])))
-    if not diffs: st.info("Nessuna quantità modificata."); return
+    if not diffs:
+        st.info("Nessuna quantità modificata.")
+        return
     with get_con() as con:
         for q, rid in diffs:
             _exec(con, "UPDATE righe_distinta SET quantita=? WHERE id=?", (q, rid))
         con.commit()
     st.success(f"Aggiornate {len(diffs)} righe.")
 
-def delete_riga(rid: int):
+def delete_riga(riga_id: int):
     with get_con() as con:
-        _exec(con, "DELETE FROM righe_distinta WHERE id=?", (rid,))
-        con.commit(); st.success("Riga eliminata.")
+        _exec(con, "DELETE FROM righe_distinta WHERE id=?", (riga_id,))
+        con.commit()
+        st.success("Riga eliminata.")
 
 def delete_voce(vid: int):
     with get_con() as con:
         _exec(con, "DELETE FROM righe_distinta WHERE voce_analisi_id=?", (vid,))
         _exec(con, "DELETE FROM voci_analisi WHERE id=?", (vid,))
-        con.commit(); st.success("Voce eliminata.")
+        con.commit()
+        st.success("Voce eliminata.")
 
 def clone_voce(vid: int):
     v = get_voce(vid)
-    if not v: st.error("Voce non trovata."); return
+    if not v:
+        st.error("Voce non trovata.")
+        return
     new_code = f"{v['codice']}-COPY"
     with get_con() as con:
         try:
-            _exec(con, """INSERT INTO voci_analisi 
-                (capitolo_id, codice, descrizione, costi_generali_percentuale, utile_percentuale, voce_unita_misura, voce_quantita)
-                VALUES (?,?,?,?,?,?,?)""",
-                (v["capitolo_id"], new_code, v["descrizione"], v["cg_pct"], v["utile_pct"], v["um_voce"], v["q_voce"]))
+            _exec(con, """INSERT INTO voci_analisi (capitolo_id, codice, descrizione, costi_generali_percentuale, utile_percentuale, voce_unita_misura, voce_quantita)
+                          VALUES (?,?,?,?,?,?,?)""",
+                  (v["capitolo_id"], new_code, v["descrizione"], v["cg_pct"], v["utile_pct"], v["um_voce"], v["q_voce"]))
             new_id = _exec(con, "SELECT last_insert_rowid()").fetchone()[0]
             rows = _exec(con, "SELECT materiale_id, quantita FROM righe_distinta WHERE voce_analisi_id=?", (vid,)).fetchall()
             for m_id, q in rows:
                 _exec(con, "INSERT INTO righe_distinta (voce_analisi_id, materiale_id, quantita) VALUES (?,?,?)",
                       (new_id, m_id, q))
-            con.commit(); st.success(f"Voce clonata come codice {new_code}.")
+            con.commit()
+            st.success(f"Voce clonata come codice {new_code}.")
         except sqlite3.IntegrityError:
             st.error("Esiste già una voce con quel codice; riprova.")
+# --- Eliminazioni con controlli di collegamenti ---
+
+def delete_cliente(cid: int):
+    with get_con() as con:
+        used = _exec(con, "SELECT COUNT(*) FROM preventivi WHERE cliente_id=?", (cid,)).fetchone()[0]
+        if used:
+            st.warning("Impossibile eliminare: il cliente ha preventivi collegati.")
+            return
+        _exec(con, "DELETE FROM clienti WHERE id=?", (cid,))
+        con.commit()
+        st.success("Cliente eliminato.")
+
+def delete_materiale(mid: int):
+    with get_con() as con:
+        used = _exec(con, "SELECT COUNT(*) FROM righe_distinta WHERE materiale_id=?", (mid,)).fetchone()[0]
+        if used:
+            st.warning("Impossibile eliminare: materiale presente in almeno una voce di analisi.")
+            return
+        _exec(con, "DELETE FROM materiali_base WHERE id=?", (mid,))
+        con.commit()
+        st.success("Materiale eliminato.")
 
 # ------------------------------------------------------------------
 # Import/Export
 # ------------------------------------------------------------------
-def export_excel():
+def import_materiali_csv(file):
+    try:
+        df = pd.read_csv(file)
+    except Exception:
+        file.seek(0)
+        df = pd.read_excel(file)
+
+    required = {"categoria","fornitore","codice_fornitore","descrizione","unita_misura","prezzo_unitario"}
+    cols_lower = {c.lower(): c for c in df.columns}
+    if not required.issubset(set(cols_lower.keys())):
+        missing = required - set(cols_lower.keys())
+        st.error(f"Colonne mancanti: {', '.join(missing)}")
+        return
+
+    df = df.rename(columns={v: k.lower() for k, v in cols_lower.items()})
+    if "quantita_default" not in df.columns:
+        df["quantita_default"] = 1.0
+
+    with get_con() as con:
+        for _, r in df.iterrows():
+            um = str(r["unita_misura"]).strip()
+            if um not in UM_CHOICES:
+                st.warning(f"UM non valida '{um}' per codice {r['codice_fornitore']} → saltato.")
+                continue
+
+            cat = str(r["categoria"]).strip()
+            row = _exec(con, "SELECT id FROM categorie WHERE nome=?", (cat,)).fetchone()
+            if not row:
+                _exec(con, "INSERT INTO categorie (nome) VALUES (?)", (cat,))
+                cat_id = _exec(con, "SELECT last_insert_rowid()").fetchone()[0]
+            else:
+                cat_id = row[0]
+
+            forn = str(r["fornitore"]).strip()
+            row = _exec(con, "SELECT id FROM fornitori WHERE nome=?", (forn,)).fetchone()
+            if not row:
+                _exec(con, "INSERT INTO fornitori (nome) VALUES (?)", (forn,))
+                forn_id = _exec(con, "SELECT last_insert_rowid()").fetchone()[0]
+            else:
+                forn_id = row[0]
+
+            try:
+                _exec(con, """INSERT INTO materiali_base
+                              (categoria_id, fornitore_id, codice_fornitore, descrizione, unita_misura, quantita_default, prezzo_unitario)
+                              VALUES (?,?,?,?,?,?,?)""",
+                      (cat_id, forn_id, str(r["codice_fornitore"]).strip(), str(r["descrizione"]).strip(),
+                       um, float(r.get("quantita_default", 1.0)), float(r["prezzo_unitario"])))
+                con.commit()
+            except sqlite3.IntegrityError:
+                st.warning(f"Duplicato: {forn} / {r['codice_fornitore']} → saltato.")
+    st.success("Import materiali completato.")
+
+def import_fornitori_csv(file):
+    try:
+        df = pd.read_csv(file)
+    except Exception:
+        file.seek(0)
+        df = pd.read_excel(file)
+
+    cols = {c.lower(): c for c in df.columns}
+    if "nome" not in cols:
+        st.error("Colonna obbligatoria mancante: 'nome'")
+        return
+
+    df = df.rename(columns={v: k.lower() for k, v in cols.items()})
+    with get_con() as con:
+        inserted, skipped = 0, 0
+        for _, r in df.iterrows():
+            name = str(r["nome"]).strip()
+            if not name:
+                skipped += 1
+                continue
+            exists = _exec(con, "SELECT 1 FROM fornitori WHERE nome=?", (name,)).fetchone()
+            if exists:
+                skipped += 1
+                continue
+            _exec(con, """INSERT INTO fornitori (nome,piva,indirizzo,email,telefono)
+                          VALUES (?,?,?,?,?)""",
+                  (name, str(r.get("piva") or ""), str(r.get("indirizzo") or ""),
+                   str(r.get("email") or ""), str(r.get("telefono") or "")))
+            inserted += 1
+        con.commit()
+    st.success(f"Import fornitori completato. Inseriti: {inserted}, saltati: {skipped}.")
+
+def export_excel():  # SOLO Sommario EPU con Nome Capitolo (come richiesto)
     voci = df_voci()
     if voci.empty:
-        st.warning("Non ci sono voci da esportare."); return None
+        st.warning("Non ci sono voci da esportare.")
+        return None
 
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        # 1) Sommario EPU con Nome Capitolo
         rows = []
         for _, r in voci.iterrows():
             tot = compute_totali_voce(int(r.id))
@@ -419,94 +607,206 @@ def export_excel():
             })
         df_sommario = pd.DataFrame(rows).sort_values(["Codice Capitolo", "Cod. Voce"])
         df_sommario.to_excel(writer, index=False, sheet_name="Sommario EPU")
-
     buffer.seek(0)
     return buffer
 
-
-
-def import_materiali_csv(file):
-    # accetta csv o xlsx
-    try:
-        df = pd.read_csv(file)
-    except Exception:
-        file.seek(0); df = pd.read_excel(file)
-
-    required = {"categoria","fornitore","codice_fornitore","descrizione","unita_misura","prezzo_unitario"}
-    cols_lower = {c.lower(): c for c in df.columns}
-    if not required.issubset(set(cols_lower.keys())):
-        missing = required - set(cols_lower.keys())
-        st.error(f"Colonne mancanti: {', '.join(missing)}"); return
-
-    # normalizza nomi
-    df = df.rename(columns={v: k.lower() for k, v in cols_lower.items()})
-    if "quantita_default" not in df.columns: df["quantita_default"] = 1.0
-
+# ------------------------------------------------------------------
+# CLIENTI / PREVENTIVI
+# ------------------------------------------------------------------
+def df_clienti():
     with get_con() as con:
-        for _, r in df.iterrows():
-            um = str(r["unita_misura"]).strip()
-            if um not in UM_CHOICES:
-                st.warning(f"UM non valida '{um}' per codice {r['codice_fornitore']} → saltato."); continue
+        return pd.read_sql_query("""
+            SELECT id, nome, piva, indirizzo, cap, citta, provincia, nazione, email, telefono, note
+            FROM clienti ORDER BY nome
+        """, con)
 
-            # cat
-            cat = str(r["categoria"]).strip()
-            row = _exec(con, "SELECT id FROM categorie WHERE nome=?", (cat,)).fetchone()
-            if not row:
-                _exec(con, "INSERT INTO categorie (nome) VALUES (?)", (cat,))
-                cat_id = _exec(con, "SELECT last_insert_rowid()").fetchone()[0]
-            else:
-                cat_id = row[0]
-            # fornitore
-            forn = str(r["fornitore"]).strip()
-            row = _exec(con, "SELECT id FROM fornitori WHERE nome=?", (forn,)).fetchone()
-            if not row:
-                _exec(con, "INSERT INTO fornitori (nome) VALUES (?)", (forn,))
-                forn_id = _exec(con, "SELECT last_insert_rowid()").fetchone()[0]
-            else:
-                forn_id = row[0]
-            try:
-                _exec(con, """INSERT INTO materiali_base
-                              (categoria_id, fornitore_id, codice_fornitore, descrizione, unita_misura, quantita_default, prezzo_unitario)
-                              VALUES (?,?,?,?,?,?,?)""",
-                      (cat_id, forn_id, str(r["codice_fornitore"]).strip(), str(r["descrizione"]).strip(),
-                       um, float(r.get("quantita_default", 1.0)), float(r["prezzo_unitario"])))
-                con.commit()
-            except sqlite3.IntegrityError:
-                st.warning(f"Duplicato: {forn} / {r['codice_fornitore']} → saltato.")
-    st.success("Import materiali completato.")
-
-def import_fornitori_csv(file):
-    # accetta csv o xlsx
-    try:
-        df = pd.read_csv(file)
-    except Exception:
-        file.seek(0); df = pd.read_excel(file)
-
-    # schema richiesto
-    # nome (obbl.), piva, indirizzo, email, telefono
-    cols = {c.lower(): c for c in df.columns}
-    if "nome" not in cols:
-        st.error("Colonna obbligatoria mancante: 'nome'"); return
-
-    df = df.rename(columns={v: k.lower() for k, v in cols.items()})
+def add_cliente(**kwargs):
     with get_con() as con:
-        inserted, skipped = 0, 0
-        for _, r in df.iterrows():
-            name = str(r["nome"]).strip()
-            if not name: skipped += 1; continue
-            exists = _exec(con, "SELECT 1 FROM fornitori WHERE nome=?", (name,)).fetchone()
-            if exists:
-                skipped += 1; continue
-            _exec(con, """INSERT INTO fornitori (nome,piva,indirizzo,email,telefono)
-                          VALUES (?,?,?,?,?)""",
-                  (name, str(r.get("piva") or ""), str(r.get("indirizzo") or ""),
-                   str(r.get("email") or ""), str(r.get("telefono") or "")))
-            inserted += 1
+        _exec(con, """INSERT INTO clienti (nome,piva,indirizzo,cap,citta,provincia,nazione,email,telefono,note)
+                      VALUES (?,?,?,?,?,?,?,?,?,?)""",
+              (kwargs.get("nome","").strip(), kwargs.get("piva",""), kwargs.get("indirizzo",""),
+               kwargs.get("cap",""), kwargs.get("citta",""), kwargs.get("provincia",""), kwargs.get("nazione",""),
+               kwargs.get("email",""), kwargs.get("telefono",""), kwargs.get("note","")))
         con.commit()
-    st.success(f"Import fornitori completato. Inseriti: {inserted}, saltati: {skipped} (duplicati o senza nome).")
+        st.success("Cliente inserito.")
+
+def create_preventivo(numero: str, data_iso: str, cliente_id: int, note_finali: str, iva_percent: float) -> int:
+    with get_con() as con:
+        _exec(con, """INSERT INTO preventivi (numero,data,cliente_id,note_finali,iva_percentuale,imponibile,iva_importo,totale)
+                      VALUES (?,?,?,?,?,?,?,?)""",
+              (numero.strip(), data_iso, int(cliente_id), note_finali, float(iva_percent or 0.0), 0.0, 0.0, 0.0))
+        pid = _exec(con, "SELECT last_insert_rowid()").fetchone()[0]
+        con.commit()
+        return int(pid)
+
+def add_riga_preventivo(pid: int, capitolo_id: int, voce_id: int, descrizione: str, note: str,
+                        um: str, quantita: float, prezzo_unitario: float):
+    prezzo_totale = float(quantita) * float(prezzo_unitario)
+    with get_con() as con:
+        _exec(con, """INSERT INTO preventivo_righe
+                      (preventivo_id,capitolo_id,voce_id,descrizione,note,um,quantita,prezzo_unitario,prezzo_totale)
+                      VALUES (?,?,?,?,?,?,?,?,?)""",
+              (int(pid), int(capitolo_id), int(voce_id), descrizione.strip(), note, um, float(quantita),
+               float(prezzo_unitario), prezzo_totale))
+        con.commit()
+
+def df_preventivo(pid: int):
+    with get_con() as con:
+        testa = pd.read_sql_query("""
+            SELECT p.id, p.numero, p.data, p.cliente_id, p.note_finali, p.iva_percentuale, p.imponibile, p.iva_importo, p.totale,
+                   c.nome AS cliente_nome, c.piva, c.indirizzo, c.cap, c.citta, c.provincia, c.nazione, c.email, c.telefono
+            FROM preventivi p
+            JOIN clienti c ON c.id = p.cliente_id
+            WHERE p.id = ?
+        """, con, params=[pid])
+        righe = pd.read_sql_query("""
+            SELECT r.id, r.preventivo_id, r.capitolo_id, cap.codice AS capitolo_codice, cap.nome AS capitolo_nome,
+                   r.voce_id, v.codice AS voce_codice,
+                   r.descrizione, r.note, r.um, r.quantita, r.prezzo_unitario, r.prezzo_totale
+            FROM preventivo_righe r
+            JOIN capitoli cap ON cap.id = r.capitolo_id
+            JOIN voci_analisi v ON v.id = r.voce_id
+            WHERE r.preventivo_id = ?
+            ORDER BY cap.codice, v.codice, r.id
+        """, con, params=[pid])
+        return testa, righe
+
+def ricalcola_totali_preventivo(pid: int, iva_percent: Optional[float] = None):
+    with get_con() as con:
+        imp = _exec(con, "SELECT IFNULL(SUM(prezzo_totale),0) FROM preventivo_righe WHERE preventivo_id=?", (pid,)).fetchone()[0]
+        if iva_percent is None:
+            iva_percent = _exec(con, "SELECT iva_percentuale FROM preventivi WHERE id=?", (pid,)).fetchone()[0]
+        iva_imp = imp * float(iva_percent) / 100.0
+        tot = imp + iva_imp
+        _exec(con, "UPDATE preventivi SET imponibile=?, iva_percentuale=?, iva_importo=?, totale=? WHERE id=?",
+              (imp, float(iva_percent), iva_imp, tot, pid))
+        con.commit()
+
+def export_preventivo_excel(pid: int):
+    testa, righe = df_preventivo(pid)
+    if testa.empty:
+        return None
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as w:
+        testa.to_excel(w, index=False, sheet_name="Testata")
+        righe.to_excel(w, index=False, sheet_name="Righe")
+        if not righe.empty:
+            bycap = (righe.groupby(["capitolo_codice","capitolo_nome"])["prezzo_totale"]
+                     .sum().reset_index().rename(columns={"prezzo_totale":"Totale capitolo (€)"}))
+        else:
+            bycap = pd.DataFrame(columns=["capitolo_codice","capitolo_nome","Totale capitolo (€)"])
+        bycap.to_excel(w, index=False, sheet_name="Totali capitoli")
+        riepilogo = testa[["numero","data","cliente_nome","imponibile","iva_percentuale","iva_importo","totale"]].copy()
+        riepilogo = riepilogo.rename(columns={"numero":"Numero","data":"Data","cliente_nome":"Cliente",
+                                              "imponibile":"Imponibile (€)","iva_percentuale":"IVA %","iva_importo":"IVA (€)","totale":"Totale (€)"})
+        riepilogo.to_excel(w, index=False, sheet_name="Riepilogo")
+    buffer.seek(0)
+    return buffer
+
+def df_preventivi_archivio(numero_like: str = "", data_like: str = "", cliente_id: Optional[int] = None):
+    with get_con() as con:
+        q = """
+        SELECT p.id, p.numero, p.data,
+               COALESCE(c.nome, '[cliente mancante]') AS cliente,
+               p.imponibile, p.iva_percentuale, p.totale
+        FROM preventivi p
+        LEFT JOIN clienti c ON c.id = p.cliente_id
+        WHERE 1=1
+        """
+        params = []
+        if numero_like:
+            q += " AND p.numero LIKE ?"; params.append(f"%{numero_like}%")
+        if data_like:
+            q += " AND p.data LIKE ?"; params.append(f"%{data_like}%")
+        if cliente_id:
+            q += " AND p.cliente_id = ?"; params.append(int(cliente_id))
+        q += " ORDER BY p.data DESC, p.numero DESC"
+        return pd.read_sql_query(q, con, params=params)
+
+    
+def export_preventivo_docx(pid: int):
+    from docx import Document
+    from docx.shared import Pt, Cm
+
+    testa, righe = df_preventivo(pid)
+    if testa.empty:
+        return None
+
+    d = Document()
+    # Titolo
+    d.add_heading(f"Preventivo {testa['numero'].iloc[0]} del {testa['data'].iloc[0]}", level=1)
+
+    # Cliente
+    cli = [
+        f"Cliente: {testa['cliente_nome'].iloc[0]}",
+        f"P.IVA/CF: {testa['piva'].iloc[0] or '-'}",
+        f"Indirizzo: {testa['indirizzo'].iloc[0] or '-'}",
+        f"Città: {testa['cap'].iloc[0] or ''} {testa['citta'].iloc[0] or ''} ({testa['provincia'].iloc[0] or ''})",
+        f"Nazione: {testa['nazione'].iloc[0] or '-'}",
+        f"Email: {testa['email'].iloc[0] or '-'}  Tel: {testa['telefono'].iloc[0] or '-'}",
+    ]
+    for r in cli:
+        d.add_paragraph(r)
+
+    d.add_paragraph("")  # spazio
+
+    # Tabella righe
+    table = d.add_table(rows=1, cols=7)
+    hdr = table.rows[0].cells
+    hdr[0].text = "Capitolo"
+    hdr[1].text = "Voce"
+    hdr[2].text = "Descrizione"
+    hdr[3].text = "UM"
+    hdr[4].text = "Q.tà"
+    hdr[5].text = "Prezzo U (€)"
+    hdr[6].text = "Totale (€)"
+
+    for _, r in righe.iterrows():
+        row = table.add_row().cells
+        row[0].text = f"{r['capitolo_codice']} {r['capitolo_nome']}"
+        row[1].text = str(r["voce_codice"])
+        row[2].text = str(r["descrizione"])
+        row[3].text = str(r["um"])
+        row[4].text = f"{r['quantita']:.2f}"
+        row[5].text = f"{r['prezzo_unitario']:.2f}"
+        row[6].text = f"{r['prezzo_totale']:.2f}"
+
+        if r.get("note"):
+            d.add_paragraph(f"Note: {r['note']}")
+
+    d.add_paragraph("")
+
+    # Totali per capitolo
+    if not righe.empty:
+        bycap = (righe.groupby(["capitolo_codice","capitolo_nome"])["prezzo_totale"].sum()
+                 .reset_index().rename(columns={"prezzo_totale":"Totale capitolo (€)"}))
+        d.add_paragraph("Totali per capitolo:")
+        for _, rr in bycap.iterrows():
+            d.add_paragraph(f"- {rr['capitolo_codice']} {rr['capitolo_nome']}: € {rr['Totale capitolo (€)']:.2f}")
+
+    d.add_paragraph("")
+
+    # Riepilogo documento
+    imp = float(testa["imponibile"].iloc[0])
+    iva_p = float(testa["iva_percentuale"].iloc[0])
+    iva_imp = float(testa["iva_importo"].iloc[0])
+    tot = float(testa["totale"].iloc[0])
+
+    d.add_paragraph(f"Imponibile: € {imp:.2f}")
+    d.add_paragraph(f"IVA {iva_p:.0f}%: € {iva_imp:.2f}")
+    d.add_paragraph(f"Totale documento: € {tot:.2f}")
+
+    if testa["note_finali"].iloc[0]:
+        d.add_paragraph("")
+        d.add_paragraph(f"Note finali: {testa['note_finali'].iloc[0]}")
+
+    buf = io.BytesIO()
+    d.save(buf)
+    buf.seek(0)
+    return buf
 
 # ------------------------------------------------------------------
-# UI – Categorie e Fornitori
+# UI – Categorie
 # ------------------------------------------------------------------
 def ui_categorie():
     st.subheader("Categorie")
@@ -521,8 +821,12 @@ def ui_categorie():
         if not df.empty:
             del_id = st.selectbox("Elimina categoria", options=[None]+df["id"].tolist(),
                                   format_func=lambda x: "—" if x is None else df[df["id"]==x]["nome"].iloc[0])
-            if del_id and st.button("Elimina"): delete_categoria(int(del_id)); st.rerun()
+            if del_id and st.button("Elimina"):
+                delete_categoria(int(del_id)); st.rerun()
 
+# ------------------------------------------------------------------
+# UI – Fornitori
+# ------------------------------------------------------------------
 def ui_fornitori():
     st.subheader("Fornitori")
     df = df_fornitori()
@@ -533,12 +837,12 @@ def ui_fornitori():
         piva = c1.text_input("P.IVA")
         indirizzo = c2.text_input("Indirizzo")
         email = c2.text_input("Email")
-        telefono = c2.text_input("Telefono")
+        telefono = c1.text_input("Telefono", key="tel_forn")
         if st.button("Aggiungi") and nome:
             add_fornitore(nome, piva, indirizzo, email, telefono); st.rerun()
 
     with st.expander("📥 Import fornitori da CSV/Excel"):
-        st.markdown("**Schema richiesto**: `nome` (obbl.), `piva`, `indirizzo`, `email`, `telefono` (opzionali).")
+        st.markdown("**Schema**: `nome` (obbl.), `piva`, `indirizzo`, `email`, `telefono` (opzionali).")
         up = st.file_uploader("Carica .csv o .xlsx", type=["csv","xlsx"], key="up_fornitori")
         if up is not None:
             import_fornitori_csv(up); st.rerun()
@@ -550,21 +854,20 @@ def ui_fornitori():
             delete_fornitore(int(fid)); st.rerun()
 
 # ------------------------------------------------------------------
-# UI – Materiali (inline edit + import)
+# UI – Materiali
 # ------------------------------------------------------------------
 def ui_materiali():
     st.subheader("Archivio prezzi base (Materiali)")
 
     cat_df = df_categorie(); forn_df = df_fornitori()
     if cat_df.empty or forn_df.empty:
-        st.info("Servono almeno 1 Categoria e 1 Fornitore."); return
+        st.info("Servono almeno 1 Categoria e 1 Fornitore.")
+        return
 
     with st.form("form_materiale"):
         c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.2, 1.6])
-        categoria_id = c1.selectbox("Categoria", options=cat_df["id"],
-                                    format_func=lambda i: cat_df[cat_df["id"]==i]["nome"].iloc[0])
-        fornitore_id = c2.selectbox("Fornitore", options=forn_df["id"],
-                                    format_func=lambda i: forn_df[forn_df["id"]==i]["nome"].iloc[0])
+        categoria_id = c1.selectbox("Categoria", options=cat_df["id"], format_func=lambda i: cat_df[cat_df["id"]==i]["nome"].iloc[0])
+        fornitore_id = c2.selectbox("Fornitore", options=forn_df["id"], format_func=lambda i: forn_df[forn_df["id"]==i]["nome"].iloc[0])
         codice_fornitore = c3.text_input("Codice fornitore *")
         um = c4.selectbox("UM", UM_CHOICES)
 
@@ -579,7 +882,6 @@ def ui_materiali():
             else:
                 add_materiale(categoria_id, fornitore_id, codice_fornitore, descrizione, um, qdef, prezzo); st.rerun()
 
-    # Lista + inline edit
     df = df_materiali()
     st.caption(f"{len(df)} materiali")
     view = df[["id","categoria","fornitore","codice_fornitore","descrizione","unita_misura","quantita_default","prezzo_unitario"]].copy()
@@ -641,22 +943,20 @@ def ui_voci():
     st.subheader("Voci di analisi")
     cap = df_capitoli(); mats = df_materiali()
     if cap.empty: st.info("Crea almeno un capitolo."); return
-    if mats.empty: st.info("Aggiungi almeno un materiale."); return
+    if mats.empty: st.info("Aggiungi almeno un materiale nell'Archivio."); return
 
     with st.form("form_voce"):
         c1, c2 = st.columns([2, 3])
         cap_map = {int(r.id): f"{r.codice} – {r.nome}" for _, r in cap.iterrows()}
         capitolo_id = c1.selectbox("Capitolo", options=list(cap_map.keys()), format_func=lambda x: cap_map[x])
-        # default dal capitolo scelto
         rowc = cap[cap["id"]==capitolo_id].iloc[0]
         cg_def, ut_def = float(rowc["cg_def"]), float(rowc["ut_def"])
 
         codice = c1.text_input("Codice voce", placeholder="Es. 01")
         descrizione = c2.text_input("Descrizione voce", placeholder="Es. Recinzione di cantiere")
         cg_pct = c1.number_input("Spese generali (%)", min_value=0.0, value=cg_def, step=0.5)
-        utile_pct = c1.number_input("Utile impresa (%)", min_value=0.0, value=ut_def, step=0.5,
-                                    help="Calcolato su (materie + spese generali).")
-        um_voce = c2.selectbox("UM della VOCE (misura prodotta)", UM_CHOICES, index=UM_CHOICES.index("Mt") if "Mt" in UM_CHOICES else 0)
+        utile_pct = c1.number_input("Utile impresa (%)", min_value=0.0, value=ut_def, step=0.5, help="Calcolato su (materie + spese generali).")
+        um_voce = c2.selectbox("UM della VOCE (misura prodotta)", UM_CHOICES)
         q_voce = c2.number_input("Quantità della VOCE (misura prodotta)", min_value=0.0, value=1.0, step=0.1)
 
         if st.form_submit_button("➕ Crea voce"):
@@ -678,8 +978,7 @@ def ui_voci():
                      use_container_width=True, hide_index=True, height=320)
         ids = voci["id"].tolist()
         label = [f"{r.capitolo_codice} {r.codice} – {r.descrizione[:50]}" for _, r in voci.iterrows()]
-        voce_sel = st.selectbox("Seleziona voce", options=[None]+ids,
-                                format_func=lambda x: "—" if x is None else label[ids.index(x)])
+        voce_sel = st.selectbox("Seleziona voce", options=[None]+ids, format_func=lambda x: "—" if x is None else label[ids.index(x)])
         colA, colB, colC = st.columns(3)
         if voce_sel and colA.button("🗑️ Elimina voce"): delete_voce(int(voce_sel)); st.rerun()
         if voce_sel and colB.button("🧬 Duplica voce"): clone_voce(int(voce_sel)); st.rerun()
@@ -705,9 +1004,8 @@ def ui_voci():
             qta = co2.number_input("Quantità", min_value=0.0, value=1.0, step=0.1, key=f"q_{voce_sel}")
             if co3.button("➕ Aggiungi", key=f"add_{voce_sel}"):
                 if qta <= 0: st.warning("Quantità > 0")
-                else: add_riga(int(voce_sel), int(mat_id), float(qta)); st.rerun()
+                else: add_riga_distinta(int(voce_sel), int(mat_id), float(qta)); st.rerun()
 
-            # Inline edit quantità righe
             righe = df_righe(int(voce_sel))
             if righe.empty: st.info("Nessuna riga in distinta.")
             else:
@@ -729,9 +1027,8 @@ def ui_voci():
             m4.metric("Totale voce (€)", f"{tot['totale']:.2f}")
 
 # ------------------------------------------------------------------
-# UI – Sommario + Export
+# UI – Sommario EPU (a livelli, Capitolo senza totali) + export
 # ------------------------------------------------------------------
-
 def ui_sommario():
     st.subheader("Sommario EPU")
 
@@ -740,7 +1037,7 @@ def ui_sommario():
         st.info("Nessuna voce disponibile.")
         return
 
-    # Tabella sintetica (manteniamola)
+    # Tabella sintetica
     rows = []
     for _, r in voci.iterrows():
         tot = compute_totali_voce(int(r.id))
@@ -763,11 +1060,9 @@ def ui_sommario():
     st.dataframe(df_sum.drop(columns=["voce_id","CapitoloNome"]), use_container_width=True, hide_index=True)
 
     st.markdown("### Dettaglio a livelli")
-
-    # Livello 1: Capitolo (solo codice, nome, n. voci) → Livello 2: Voce → Dettaglio righe
     for (cap_code, cap_name), grp in df_sum.groupby(["Capitolo","CapitoloNome"]):
         with st.expander(f"📁 Capitolo {cap_code} — {cap_name} | Voci: {len(grp)}", expanded=False):
-            # NIENTE totalizzatori di prezzo a livello capitolo
+            # Nessun totale a livello capitolo
             for _, r in grp.iterrows():
                 titolo_voce = f"🧩 Voce {r['Cod. Voce']} – {r['Descrizione']} ({r['Q.tà Voce']} {r['UM Voce']}) | Totale € {r['Totale (€)']:.2f}"
                 with st.expander(titolo_voce, expanded=False):
@@ -778,28 +1073,296 @@ def ui_sommario():
                         show = righe[["categoria","fornitore","codice_fornitore","materiale_descrizione",
                                       "unita_misura","prezzo_unitario","quantita","subtotale"]]
                         st.dataframe(show, use_container_width=True, hide_index=True)
-                    # metriche voce (ok mostrarle qui)
                     st.caption(f"Materie € {r['Materie (€)']:.2f} | Spese generali € {r['Spese generali (€)']:.2f} | Utile € {r['Utile (€)']:.2f}")
 
-    # Export (già include tutto il dettaglio)
+    # Export Excel (solo Sommario EPU + Nome Capitolo)
     buf = export_excel()
     if buf:
-        st.download_button("⬇️ Esporta Excel (Sommario + Distinte + Dettaglio voci + Capitoli)",
-                           data=buf.getvalue(),
-                           file_name="EPU_export.xlsx",
+        st.download_button("⬇️ Esporta Excel (Sommario EPU)", data=buf.getvalue(),
+                           file_name="EPU_sommario.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+# ------------------------------------------------------------------
+# UI – Clienti (riusata nella pagina Preventivi)
+# ------------------------------------------------------------------
+def ui_clienti():
+    st.subheader("Clienti")
+    df = df_clienti()
+    st.dataframe(df, use_container_width=True, hide_index=True, height=260)
+
+    with st.expander("➕ Nuovo cliente"):
+        c1, c2 = st.columns(2)
+        c3, c4 = st.columns(2)
+        nome = c1.text_input("Nome *")
+        piva = c1.text_input("P.IVA / CF")
+        indirizzo = c2.text_input("Indirizzo")
+        cap = c3.text_input("CAP")
+        citta = c3.text_input("Città", key="citta_cli")
+        provincia = c4.text_input("Provincia")
+        nazione = c4.text_input("Nazione", value="Italia")
+        email = c1.text_input("Email", key="email_cli")
+        telefono = c2.text_input("Telefono", key="tel_cli")
+        note = st.text_area("Note")
+        if st.button("Salva cliente") and nome:
+            add_cliente(nome=nome, piva=piva, indirizzo=indirizzo, cap=cap, citta=citta, provincia=provincia,
+                        nazione=nazione, email=email, telefono=telefono, note=note)
+            st.rerun()
+
+    # --- Elimina cliente (solo se senza preventivi) ---
+    if not df.empty:
+        st.divider()
+        cid = st.selectbox("Elimina cliente", options=[None] + df["id"].tolist(),
+                           format_func=lambda x: "—" if x is None else df[df["id"]==x]["nome"].iloc[0])
+        if cid and st.button("Elimina cliente selezionato"):
+            delete_cliente(int(cid))
+            st.rerun()
+
+
+# ------------------------------------------------------------------
+# UI – Preventivi
+# ------------------------------------------------------------------
+def render_preventivo_view(pid: int):
+    # Mostra dettagli, totali e export per un preventivo esistente (vista in Archivio)
+    testa, righe = df_preventivo(int(pid))
+    if testa.empty:
+        st.warning("Preventivo non trovato.")
+        return
+
+    st.markdown(
+        f"#### Preventivo {testa['numero'].iloc[0]} del {testa['data'].iloc[0]} – {testa['cliente_nome'].iloc[0]}"
+    )
+
+    if not righe.empty:
+        st.dataframe(
+            righe[
+                [
+                    "capitolo_codice",
+                    "capitolo_nome",
+                    "voce_codice",
+                    "descrizione",
+                    "um",
+                    "quantita",
+                    "prezzo_unitario",
+                    "prezzo_totale",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        by_cap = (
+            righe.groupby(["capitolo_codice", "capitolo_nome"])["prezzo_totale"]
+            .sum()
+            .reset_index()
+            .rename(columns={"prezzo_totale": "Totale (€)"})
+        )
+        st.markdown("**Totali per capitolo**")
+        st.dataframe(by_cap, use_container_width=True, hide_index=True)
+    else:
+        st.info("Nessuna riga nel preventivo.")
+
+    # Totali documento
+    imp = float(testa["imponibile"].iloc[0])
+    iva_p = float(testa["iva_percentuale"].iloc[0])
+    iva_imp = float(testa["iva_importo"].iloc[0])
+    tot = float(testa["totale"].iloc[0])
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Imponibile (€)", f"{imp:.2f}")
+    c2.metric(f"IVA {iva_p:.0f}% (€)", f"{iva_imp:.2f}")
+    c3.metric("Totale documento (€)", f"{tot:.2f}")
+
+    # Pulsanti export con KEY univoche (evita StreamlitDuplicateElementId)
+    colx, coly = st.columns(2)
+
+    buf_xls = export_preventivo_excel(int(pid))
+    if buf_xls:
+        colx.download_button(
+            "⬇️ Excel",
+            data=buf_xls.getvalue(),
+            file_name=f"Preventivo_{testa['numero'].iloc[0]}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"dl_xls_view_{pid}",
+        )
+
+    buf_docx = export_preventivo_docx(int(pid))
+    if buf_docx:
+        coly.download_button(
+            "⬇️ Word (DOCX)",
+            data=buf_docx.getvalue(),
+            file_name=f"Preventivo_{testa['numero'].iloc[0]}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            key=f"dl_docx_view_{pid}",
+        )
+
+def ui_preventivi():
+    st.subheader("Preventivi")
+
+    # 3 tab: Nuovo/Modifica, Clienti, Archivio
+    tab1, tab2, tab3 = st.tabs(["🧾 Nuovo/Modifica", "👥 Clienti", "📚 Archivio"])
+
+    # --- Tab Clienti ---
+    with tab2:
+        # usa la stessa UI clienti che abbiamo già
+        ui_clienti()
+
+    # --- Tab Nuovo/Modifica ---
+    with tab1:
+        cli = df_clienti()
+        if cli.empty:
+            st.info("Inserisci almeno un Cliente nella tab 'Clienti'.")
+            return
+
+        st.markdown("### Testata preventivo")
+        c1, c2, c3 = st.columns([2,1,1])
+        cliente_id = c1.selectbox("Cliente", options=cli["id"], format_func=lambda i: cli[cli["id"]==i]["nome"].iloc[0])
+        numero = c2.text_input("Numero", placeholder="2025-001")
+        data = c3.text_input("Data (YYYY-MM-DD)", placeholder="2025-08-12")
+        note_finali = st.text_area("Note finali (facoltative)")
+        iva_percent = st.number_input("IVA %", min_value=0.0, value=22.0, step=1.0)
+
+        colh1, colh2 = st.columns([1,1])
+        if colh1.button("➕ Crea preventivo"):
+            if not (numero and data):
+                st.warning("Numero e Data sono obbligatori.")
+            else:
+                pid = create_preventivo(numero, data, int(cliente_id), note_finali, iva_percent)
+                st.session_state["preventivo_corrente"] = pid
+                st.success(f"Preventivo creato (ID {pid}).")
+                st.rerun()
+
+        # Se ho un preventivo corrente, consenti aggiunta righe e totali
+        pid = st.session_state.get("preventivo_corrente")
+        if pid:
+            st.caption(f"Preventivo corrente: ID {pid}")
+
+            st.markdown("### Aggiungi righe")
+            cap = df_capitoli()
+            if cap.empty:
+                st.info("Crea almeno un capitolo e una voce nella sezione Voci di analisi.")
+                return
+            cap_map = {int(r.id): f"{r.codice} – {r.nome}" for _, r in cap.iterrows()}
+            scel_cap = st.selectbox("Capitolo", options=list(cap_map.keys()), format_func=lambda x: cap_map[x])
+
+            voci = df_voci(scel_cap)
+            if voci.empty:
+                st.info("Nessuna voce disponibile per questo capitolo.")
+                return
+            voce_map = {int(r.id): f"{r.codice} – {r.descrizione}" for _, r in voci.iterrows()}
+            scel_voce = st.selectbox("Voce", options=list(voce_map.keys()), format_func=lambda x: voce_map[x])
+
+            v = get_voce(int(scel_voce))
+            prezzo_u = prezzo_unitario_voce(int(scel_voce))
+            desc_default = v["descrizione"]
+            um_default = v["um_voce"]
+
+            desc = st.text_input("Descrizione riga", value=desc_default)
+            note_riga = st.text_area("Note riga (facoltative)")
+            um = st.selectbox("UM", UM_CHOICES, index=UM_CHOICES.index(um_default) if um_default in UM_CHOICES else 0)
+            qta = st.number_input("Quantità", min_value=0.0, value=1.0, step=0.1)
+            st.write(f"**Prezzo unitario (auto)**: € {prezzo_u:.2f}")
+            if st.button("➕ Aggiungi riga"):
+                if qta <= 0:
+                    st.warning("Quantità > 0")
+                else:
+                    add_riga_preventivo(int(pid), int(scel_cap), int(scel_voce), desc, note_riga, um, qta, prezzo_u)
+                    ricalcola_totali_preventivo(int(pid), iva_percent)
+                    st.success("Riga aggiunta.")
+                    st.rerun()
+
+            # Vista righe + totali
+            testa, righe = df_preventivo(int(pid))
+            if not righe.empty:
+                st.markdown("#### Righe inserite")
+                st.dataframe(righe[["capitolo_codice","capitolo_nome","voce_codice","descrizione","um","quantita","prezzo_unitario","prezzo_totale"]],
+                             use_container_width=True, hide_index=True)
+
+                st.markdown("#### Totali per capitolo")
+                by_cap = (righe.groupby(["capitolo_codice","capitolo_nome"])["prezzo_totale"].sum()
+                          .reset_index().rename(columns={"prezzo_totale":"Totale (€)"}))
+                st.dataframe(by_cap, use_container_width=True, hide_index=True)
+
+            # Totali documento
+            ricalcola_totali_preventivo(int(pid), iva_percent)
+            testa, _ = df_preventivo(int(pid))
+            imp = float(testa["imponibile"].iloc[0])
+            iva_p = float(testa["iva_percentuale"].iloc[0])
+            iva_imp = float(testa["iva_importo"].iloc[0])
+            tot = float(testa["totale"].iloc[0])
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Imponibile (€)", f"{imp:.2f}")
+            c2.metric(f"IVA {iva_p:.0f}% (€)", f"{iva_imp:.2f}")
+            c3.metric("Totale documento (€)", f"{tot:.2f}")
+
+            # --- Azioni finali ---
+           
+            # 3) Salva e archivia
+            if colz.button("💾 Salva e archivia"):
+                # ricalcolo finale e memorizzo ID salvato
+                ricalcola_totali_preventivo(int(pid), iva_percent)
+                st.session_state["last_saved_preventivo_id"] = int(pid)
+                st.session_state.pop("preventivo_corrente", None)
+                st.success(f"Preventivo {testa['numero'].iloc[0]} salvato e archiviato. Vai nella tab 'Archivio' per vederlo.")
+                st.rerun()
+
+    # --- Tab Archivio ---
+    with tab3:
+        st.markdown("### Archivio preventivi")
+        cli = df_clienti()
+
+        colf1, colf2, colf3, colf4 = st.columns([1,1,1,1])
+        numero_like = colf1.text_input("Filtra per numero")
+        data_like = colf2.text_input("Filtra per data (YYYY-MM-DD)")
+        cli_sel = colf3.selectbox("Cliente", options=[0]+cli["id"].tolist(),
+                                  format_func=lambda x: "Tutti" if x==0 else cli[cli["id"]==x]["nome"].iloc[0])
+        if colf4.button("🔄 Aggiorna elenco"):
+            st.rerun()
+
+        arch = df_preventivi_archivio(numero_like, data_like, None if cli_sel==0 else cli_sel)
+        st.caption(f"{len(arch)} preventivi trovati")
+        st.dataframe(arch, use_container_width=True, hide_index=True)
+
+        # Evidenzia l’ultimo salvato (se presente in sessione)
+        last_id = st.session_state.get("last_saved_preventivo_id")
+        if last_id is not None and not arch.empty and (arch["id"] == last_id).any():
+            st.success(f"Ultimo salvato: ID {last_id}")
+            default_idx = [None] + arch["id"].tolist()
+            preselect = default_idx.index(last_id) if last_id in arch["id"].tolist() else 0
+        else:
+            default_idx = [None] + arch["id"].tolist()
+            preselect = 0
+
+        # Apri preventivo
+        opened_id = st.session_state.get("opened_preventivo_from_archivio")
+        pid_open = st.selectbox(
+            "Apri preventivo",
+            options=[None] + arch["id"].tolist(),
+            index=preselect if opened_id is None else ([None] + arch["id"].tolist()).index(opened_id) if opened_id in arch["id"].tolist() else 0,
+            format_func=lambda x: "—" if x is None else f"ID {x}"
+        )
+
+        if pid_open and st.button("Apri"):
+            st.session_state["preventivo_corrente"] = int(pid_open)  # utile anche per la tab Nuovo/Modifica
+            st.session_state["opened_preventivo_from_archivio"] = int(pid_open)
+            st.success(f"Preventivo ID {int(pid_open)} aperto qui sotto.")
+            st.rerun()
+
+        # Se c'è un preventivo selezionato/precedente, mostrane i dettagli QUI
+        pid_show = st.session_state.get("opened_preventivo_from_archivio")
+        if pid_show:
+            st.divider()
+            render_preventivo_view(int(pid_show))
 
 # ------------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------------
 def main():
     init_db()
-    st.title("🏗️ EPU Builder v1.2")
-    st.caption("Capitoli con CG%/Utile% di default; voci con UM e quantità della VOCE; inline edit; import/export; clone voci.")
+    st.title("🏗️ EPU Builder v1.3")
+    st.caption("Analisi voci (CG%/Utile% capitolo), distinte, Sommario EPU, preventivi con export Excel.")
 
     pagina = st.sidebar.radio("Navigazione", [
-        "Categorie", "Fornitori", "Archivio materiali", "Capitoli", "Voci di analisi", "Sommario EPU"
+        "Categorie", "Fornitori", "Archivio materiali", "Capitoli", "Voci di analisi", "Sommario EPU", "Preventivi"
     ])
 
     if pagina == "Categorie":
@@ -814,6 +1377,8 @@ def main():
         ui_voci()
     elif pagina == "Sommario EPU":
         ui_sommario()
+    elif pagina == "Preventivi":
+        ui_preventivi()
 
 if __name__ == "__main__":
     main()
