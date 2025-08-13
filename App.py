@@ -89,6 +89,16 @@ def init_db():
             FOREIGN KEY(capitolo_id) REFERENCES capitoli(id),
             UNIQUE(capitolo_id, codice)
         )""")
+        
+        # MIGRAZIONE: aggiunge la colonna prezzo_riferimento se manca
+        try:
+            cur.execute(
+                "ALTER TABLE voci_analisi "
+                "ADD COLUMN prezzo_riferimento REAL DEFAULT 0.0"
+            )
+        except sqlite3.OperationalError:
+            pass  # già presente
+
 
         # Righe distinta
         cur.execute("""
@@ -202,7 +212,8 @@ def df_voci(capitolo_id: Optional[int] = None):
                    IFNULL(v.costi_generali_percentuale,0) AS cg_pct,
                    IFNULL(v.utile_percentuale,0) AS utile_pct,
                    v.voce_unita_misura AS um_voce,
-                   IFNULL(v.voce_quantita,1.0) AS q_voce
+                   IFNULL(v.voce_quantita,1.0) AS q_voce,
+                   IFNULL(v.prezzo_riferimento,0.0) AS prezzo_rif
             FROM voci_analisi v
             JOIN capitoli c ON c.id = v.capitolo_id
             WHERE v.capitolo_id = ?
@@ -216,12 +227,14 @@ def df_voci(capitolo_id: Optional[int] = None):
                    IFNULL(v.costi_generali_percentuale,0) AS cg_pct,
                    IFNULL(v.utile_percentuale,0) AS utile_pct,
                    v.voce_unita_misura AS um_voce,
-                   IFNULL(v.voce_quantita,1.0) AS q_voce
+                   IFNULL(v.voce_quantita,1.0) AS q_voce,
+                   IFNULL(v.prezzo_riferimento,0.0) AS prezzo_rif
             FROM voci_analisi v
             JOIN capitoli c ON c.id = v.capitolo_id
             ORDER BY c.codice, v.codice
             """
             return pd.read_sql_query(q, con)
+
 
 def df_righe(voce_id: int):
     with get_con() as con:
@@ -247,7 +260,8 @@ def get_voce(voce_id: int) -> Optional[dict]:
                    IFNULL(v.costi_generali_percentuale,0),
                    IFNULL(v.utile_percentuale,0),
                    v.voce_unita_misura,
-                   IFNULL(v.voce_quantita,1.0)
+                   IFNULL(v.voce_quantita,1.0),
+                   IFNULL(v.prezzo_riferimento,0.0)
             FROM voci_analisi v
             JOIN capitoli c ON c.id = v.capitolo_id
             WHERE v.id = ?
@@ -259,6 +273,7 @@ def get_voce(voce_id: int) -> Optional[dict]:
             "codice": row[4], "descrizione": row[5],
             "cg_pct": float(row[6]), "utile_pct": float(row[7]),
             "um_voce": row[8], "q_voce": float(row[9]),
+            "prezzo_rif": float(row[10]),
         }
 
 # ------------------------------------------------------------------
@@ -390,13 +405,15 @@ def delete_capitolo(cid: int):
         con.commit()
         st.success("Capitolo eliminato.")
 
-def add_voce(capitolo_id, codice, descrizione, cg_pct, utile_pct, um_voce, q_voce):
+def add_voce(capitolo_id, codice, descrizione, cg_pct, utile_pct, um_voce, q_voce, prezzo_rif=0.0):
     try:
         with get_con() as con:
-            _exec(con, """INSERT INTO voci_analisi (capitolo_id, codice, descrizione, costi_generali_percentuale, utile_percentuale, voce_unita_misura, voce_quantita)
-                          VALUES (?,?,?,?,?,?,?)""",
+            _exec(con, """INSERT INTO voci_analisi
+                          (capitolo_id, codice, descrizione, costi_generali_percentuale, utile_percentuale,
+                           voce_unita_misura, voce_quantita, prezzo_riferimento)
+                          VALUES (?,?,?,?,?,?,?,?)""",
                   (int(capitolo_id), codice.strip(), descrizione.strip(), float(cg_pct or 0.0),
-                   float(utile_pct or 0.0), um_voce, float(q_voce or 1.0)))
+                   float(utile_pct or 0.0), um_voce, float(q_voce or 1.0), float(prezzo_rif or 0.0)))
             con.commit()
             st.success("Voce creata.")
     except sqlite3.IntegrityError:
@@ -409,10 +426,13 @@ def update_voce_perc(vid: int, cg_pct: float, utile_pct: float):
         con.commit()
         st.success("Percentuali aggiornate.")
 
-def update_voce_perc_umqty(vid: int, cg_pct: float, utile_pct: float, um_voce: str, q_voce: float):
+def update_voce_perc_umqty(vid: int, cg_pct: float, utile_pct: float, um_voce: str, q_voce: float, prezzo_rif: float):
     with get_con() as con:
-        _exec(con, "UPDATE voci_analisi SET costi_generali_percentuale=?, utile_percentuale=?, voce_unita_misura=?, voce_quantita=? WHERE id=?",
-              (float(cg_pct or 0.0), float(utile_pct or 0.0), um_voce, float(q_voce or 1.0), int(vid)))
+        _exec(con, """UPDATE voci_analisi
+                      SET costi_generali_percentuale=?, utile_percentuale=?, voce_unita_misura=?, voce_quantita=?, prezzo_riferimento=?
+                      WHERE id=?""",
+              (float(cg_pct or 0.0), float(utile_pct or 0.0), um_voce, float(q_voce or 1.0),
+               float(prezzo_rif or 0.0), int(vid)))
         con.commit()
         st.success("Voce aggiornata.")
 
@@ -955,15 +975,22 @@ def ui_voci():
         codice = c1.text_input("Codice voce", placeholder="Es. 01")
         descrizione = c2.text_input("Descrizione voce", placeholder="Es. Recinzione di cantiere")
         cg_pct = c1.number_input("Spese generali (%)", min_value=0.0, value=cg_def, step=0.5)
-        utile_pct = c1.number_input("Utile impresa (%)", min_value=0.0, value=ut_def, step=0.5, help="Calcolato su (materie + spese generali).")
+        utile_pct = c1.number_input("Utile impresa (%)", min_value=0.0, value=ut_def, step=0.5,
+                                help="Calcolato su (materie + spese generali).")
         um_voce = c2.selectbox("UM della VOCE (misura prodotta)", UM_CHOICES)
         q_voce = c2.number_input("Quantità della VOCE (misura prodotta)", min_value=0.0, value=1.0, step=0.1)
 
-        if st.form_submit_button("➕ Crea voce"):
-            if not (codice and descrizione and um_voce and q_voce > 0):
-                st.warning("Compila codice, descrizione, UM voce e quantità voce (>0).")
-            else:
-                add_voce(capitolo_id, codice, descrizione, cg_pct, utile_pct, um_voce, q_voce); st.rerun()
+    # nuovo campo: prezzo di riferimento
+    prezzo_rif_form = c1.number_input("Prezzo di riferimento (opzionale)", min_value=0.0,
+                                      value=0.0, step=0.01, format="%.2f")
+
+    if st.form_submit_button("➕ Crea voce"):
+        if not (codice and descrizione and um_voce and q_voce > 0):
+            st.warning("Compila codice, descrizione, UM voce e quantità voce (>0).")
+        else:
+            add_voce(capitolo_id, codice, descrizione, cg_pct, utile_pct, um_voce, q_voce, prezzo_rif_form)
+            st.rerun()
+
 
     filtro = st.selectbox("Filtra per capitolo", options=[0]+list(cap_map.keys()),
                           format_func=lambda x: "Tutti" if x==0 else cap_map[x])
@@ -983,41 +1010,130 @@ def ui_voci():
         if voce_sel and colA.button("🗑️ Elimina voce"): delete_voce(int(voce_sel)); st.rerun()
         if voce_sel and colB.button("🧬 Duplica voce"): clone_voce(int(voce_sel)); st.rerun()
 
+# --- DETTAGLIO VOCE SELEZIONATA ---
+def ui_voci():
+    st.subheader("Voci di analisi")
+
+    cap = df_capitoli()
+    mats_all = df_materiali()
+    if cap.empty:
+        st.info("Crea almeno un capitolo.")
+        return
+    if mats_all.empty:
+        st.info("Aggiungi almeno un materiale nell'Archivio.")
+        return
+
+    # ---------------------------
+    # CREA NUOVA VOCE
+    # ---------------------------
+    with st.form("form_voce"):
+        c1, c2 = st.columns([2, 3])
+        cap_map = {int(r.id): f"{r.codice} – {r.nome}" for _, r in cap.iterrows()}
+        capitolo_id = c1.selectbox("Capitolo", options=list(cap_map.keys()), format_func=lambda x: cap_map[x])
+
+        rowc = cap[cap["id"] == capitolo_id].iloc[0]
+        cg_def, ut_def = float(rowc["cg_def"]), float(rowc["ut_def"])
+
+        codice = c1.text_input("Codice voce", placeholder="Es. 01")
+        descrizione = c2.text_input("Descrizione voce", placeholder="Es. Recinzione di cantiere")
+        cg_pct = c1.number_input("Spese generali (%)", min_value=0.0, value=cg_def, step=0.5)
+        utile_pct = c1.number_input("Utile impresa (%)", min_value=0.0, value=ut_def, step=0.5,
+                                    help="Calcolato su (materie + spese generali).")
+        um_voce = c2.selectbox("UM della VOCE (misura prodotta)", UM_CHOICES)
+        q_voce = c2.number_input("Quantità della VOCE (misura prodotta)", min_value=0.0, value=1.0, step=0.1)
+
+        # Prezzo di riferimento (facoltativo)
+        prezzo_rif = c1.number_input("Prezzo di riferimento (facoltativo)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+
+        ok = st.form_submit_button("➕ Crea voce")
+        if ok:
+            if not (codice and descrizione and um_voce and q_voce > 0):
+                st.warning("Compila codice, descrizione, UM voce e quantità voce (>0).")
+            else:
+                add_voce(capitolo_id, codice, descrizione, cg_pct, utile_pct, um_voce, q_voce, prezzo_rif)
+                st.rerun()
+
+    # ---------------------------
+    # ELENCO + DETTAGLIO VOCE
+    # ---------------------------
+    filtro = st.selectbox("Filtra per capitolo", options=[0] + list(cap_map.keys()),
+                          format_func=lambda x: "Tutti" if x == 0 else cap_map[x])
+
+    voci = df_voci(None if filtro == 0 else filtro)
+    if voci.empty:
+        st.info("Nessuna voce trovata.")
+        return
+
+    left, right = st.columns([2, 3], vertical_alignment="top")
+
+    with left:
+        st.write("Voci disponibili")
+        st.dataframe(
+            voci.rename(columns={"cg_pct": "CG %", "utile_pct": "Utile %", "um_voce": "UM Voce", "q_voce": "Q.tà Voce"})[
+                ["id", "capitolo_codice", "codice", "descrizione", "UM Voce", "Q.tà Voce", "CG %", "Utile %"]
+            ],
+            use_container_width=True, hide_index=True, height=320
+        )
+        ids = voci["id"].tolist()
+        label = [f"{r.capitolo_codice} {r.codice} – {r.descrizione[:50]}" for _, r in voci.iterrows()]
+        voce_sel = st.selectbox("Seleziona voce", options=[None] + ids,
+                                format_func=lambda x: "—" if x is None else label[ids.index(x)])
+        colA, colB, _ = st.columns(3)
+        if voce_sel and colA.button("🗑️ Elimina voce"):
+            delete_voce(int(voce_sel)); st.rerun()
+        if voce_sel and colB.button("🧬 Duplica voce"):
+            clone_voce(int(voce_sel)); st.rerun()
+
     if voce_sel:
         with right:
             v = get_voce(int(voce_sel))
             st.markdown(f"**Voce:** {v['capitolo_codice']} {v['codice']} – {v['descrizione']}")
+
             c1, c2, c3, c4, c5 = st.columns(5)
             new_cg = c1.number_input("Spese generali (%)", min_value=0.0, value=float(v["cg_pct"]), step=0.5, key=f"cg_{voce_sel}")
             new_ut = c2.number_input("Utile impresa (%)", min_value=0.0, value=float(v["utile_pct"]), step=0.5, key=f"ut_{voce_sel}")
-            new_um = c3.selectbox("UM Voce", UM_CHOICES, index=UM_CHOICES.index(v["um_voce"]) if v["um_voce"] in UM_CHOICES else 0, key=f"um_{voce_sel}")
+            new_um = c3.selectbox("UM Voce", UM_CHOICES,
+                                  index=UM_CHOICES.index(v["um_voce"]) if v["um_voce"] in UM_CHOICES else 0,
+                                  key=f"um_{voce_sel}")
             new_qv = c4.number_input("Q.tà Voce", min_value=0.0, value=float(v["q_voce"]), step=0.1, key=f"qv_{voce_sel}")
+            new_prezzo_rif = c5.number_input("Prezzo di riferimento", min_value=0.0,
+                                             value=float(v.get("prezzo_rif", 0.0)), step=0.01, format="%.2f")
+
             if c5.button("💾 Aggiorna voce"):
-                update_voce_perc_umqty(int(voce_sel), new_cg, new_ut, new_um, new_qv); st.rerun()
+                update_voce_perc_umqty(int(voce_sel), new_cg, new_ut, new_um, new_qv, new_prezzo_rif)
+                st.rerun()
 
             st.divider()
             st.write("Distinta base – aggiungi riga")
             mats = df_materiali()
-            mat_map = {int(r.id): f"{r.categoria} | {r.fornitore} | {r.codice_fornitore} – {r.descrizione[:50]}" for _, r in mats.iterrows()}
+            mat_map = {int(r.id): f"{r.categoria} | {r.fornitore} | {r.codice_fornitore} – {r.descrizione[:50]}"
+                       for _, r in mats.iterrows()}
             co1, co2, co3 = st.columns([3, 1, 1])
-            mat_id = co1.selectbox("Materiale", options=list(mat_map.keys()), format_func=lambda x: mat_map[x], key=f"m_{voce_sel}")
+            mat_id = co1.selectbox("Materiale", options=list(mat_map.keys()),
+                                   format_func=lambda x: mat_map[x], key=f"m_{voce_sel}")
             qta = co2.number_input("Quantità", min_value=0.0, value=1.0, step=0.1, key=f"q_{voce_sel}")
             if co3.button("➕ Aggiungi", key=f"add_{voce_sel}"):
-                if qta <= 0: st.warning("Quantità > 0")
-                else: add_riga_distinta(int(voce_sel), int(mat_id), float(qta)); st.rerun()
+                if qta <= 0:
+                    st.warning("Quantità > 0")
+                else:
+                    add_riga_distinta(int(voce_sel), int(mat_id), float(qta))
+                    st.rerun()
 
             righe = df_righe(int(voce_sel))
-            if righe.empty: st.info("Nessuna riga in distinta.")
+            if righe.empty:
+                st.info("Nessuna riga in distinta.")
             else:
-                view = righe[["id","categoria","fornitore","codice_fornitore","materiale_descrizione",
-                              "unita_misura","prezzo_unitario","quantita","subtotale"]].copy()
+                view = righe[["id", "categoria", "fornitore", "codice_fornitore", "materiale_descrizione",
+                              "unita_misura", "prezzo_unitario", "quantita", "subtotale"]].copy()
                 edited = st.data_editor(view, use_container_width=True, num_rows="fixed",
                                         column_config={"quantita": st.column_config.NumberColumn("quantita", step=0.1)})
-                colx, coly = st.columns([1,1])
+                colx, coly = st.columns([1, 1])
                 if colx.button("💾 Salva quantità modificate"):
                     update_quantita_righe(int(voce_sel), edited, view); st.rerun()
-                rid = coly.selectbox("Elimina riga", options=[None]+righe["id"].tolist(), format_func=lambda x: "—" if x is None else f"riga #{x}")
-                if rid and st.button("Elimina selezionata"): delete_riga(int(rid)); st.rerun()
+                rid = coly.selectbox("Elimina riga", options=[None] + righe["id"].tolist(),
+                                     format_func=lambda x: "—" if x is None else f"riga #{x}")
+                if rid and st.button("Elimina selezionata"):
+                    delete_riga(int(rid)); st.rerun()
 
             tot = compute_totali_voce(int(voce_sel))
             m1, m2, m3, m4 = st.columns(4)
@@ -1025,6 +1141,7 @@ def ui_voci():
             m2.metric("Spese generali (€)", f"{tot['costi_generali']:.2f}", help=f"{tot['cg_pct']}%")
             m3.metric("Utile (€)", f"{tot['utile']:.2f}", help=f"{tot['utile_pct']}%")
             m4.metric("Totale voce (€)", f"{tot['totale']:.2f}")
+
 
 # ------------------------------------------------------------------
 # UI – Sommario EPU (a livelli, Capitolo senza totali) + export
@@ -1297,7 +1414,7 @@ def ui_preventivi():
             # --- Azioni finali ---
            
             # 3) Salva e archivia
-            if colz.button("💾 Salva e archivia"):
+            if c3.button("💾 Salva e archivia"):
                 # ricalcolo finale e memorizzo ID salvato
                 ricalcola_totali_preventivo(int(pid), iva_percent)
                 st.session_state["last_saved_preventivo_id"] = int(pid)
@@ -1358,7 +1475,7 @@ def ui_preventivi():
 # ------------------------------------------------------------------
 def main():
     init_db()
-    st.title("🏗️ EPU Builder v1.3")
+    st.title("🏗️ EPU Builder v1.3.1")
     st.caption("Analisi voci (CG%/Utile% capitolo), distinte, Sommario EPU, preventivi con export Excel.")
 
     pagina = st.sidebar.radio("Navigazione", [
