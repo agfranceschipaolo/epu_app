@@ -181,6 +181,18 @@ def init_db():
             totale REAL DEFAULT 0.0,
             FOREIGN KEY(cliente_id) REFERENCES clienti(id)
         )""")
+        # Storico prezzi materiali
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS materiali_prezzi_storico (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            materiale_id INTEGER NOT NULL,
+            prezzo_vecchio REAL NOT NULL,
+            prezzo_nuovo REAL NOT NULL,
+            changed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            note TEXT,
+            FOREIGN KEY(materiale_id) REFERENCES materiali_base(id)
+        )""")
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS preventivo_righe (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -197,20 +209,6 @@ def init_db():
             FOREIGN KEY(capitolo_id) REFERENCES capitoli(id),
             FOREIGN KEY(voce_id) REFERENCES voci_analisi(id)
         )""")
-        # Storico prezzi materiali
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS materiali_prezzi_storico (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            materiale_id INTEGER NOT NULL,
-            prezzo_vecchio REAL NOT NULL,
-            prezzo_nuovo REAL NOT NULL,
-            changed_at TEXT NOT NULL DEFAULT (datetime('now')),
-            note TEXT,
-            FOREIGN KEY(materiale_id) REFERENCES materiali_base(id)
-        )""")
-        # Indici storico
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sto_mat  ON materiali_prezzi_storico(materiale_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sto_date ON materiali_prezzi_storico(changed_at)")
 
         con.commit()
 
@@ -230,6 +228,9 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_righe_mat ON righe_distinta(materiale_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_prev_cliente ON preventivi(cliente_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_prev_data ON preventivi(data)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sto_mat ON materiali_prezzi_storico(materiale_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sto_date ON materiali_prezzi_storico(changed_at)")
+
         con.commit()
 
 @contextmanager
@@ -369,29 +370,35 @@ def compute_totali_voce(voce_id: int) -> Dict[str, float]:
         "utile_pct": voce["utile_pct"],
         "totale": totale,
     }
-# -------- (2) Impatti da aggiornamento materiali --------
+
+def prezzo_unitario_voce(voce_id: int) -> float:
+    v = get_voce(voce_id)
+    if not v:
+        return 0.0
+    tot = compute_totali_voce(voce_id)["totale"]
+    q = max(float(v["q_voce"]), 1e-9)
+    return tot / q
+
 def voci_impattate_da_materiali(material_ids: list[int]) -> pd.DataFrame:
-    """Ritorna le voci che usano almeno uno dei materiali indicati."""
+    """Ritorna le voci_analisi che usano almeno uno dei materiali indicati."""
     if not material_ids:
-        return pd.DataFrame(columns=["voce_id","capitolo_codice","capitolo_nome","codice","descrizione","prezzo_rif"])
+        return pd.DataFrame(columns=["voce_id","capitolo_codice","capitolo_nome","codice","descrizione"])
     with get_con() as con:
         q = """
-        SELECT DISTINCT v.id AS voce_id,
-               c.codice AS capitolo_codice, c.nome AS capitolo_nome,
-               v.codice, v.descrizione,
-               IFNULL(v.prezzo_riferimento,0.0) AS prezzo_rif
+        SELECT DISTINCT v.id AS voce_id, c.codice AS capitolo_codice, c.nome AS capitolo_nome,
+                        v.codice, v.descrizione, IFNULL(v.prezzo_riferimento,0.0) AS prezzo_rif
         FROM righe_distinta r
         JOIN voci_analisi v ON v.id = r.voce_analisi_id
-        JOIN capitoli c    ON c.id = v.capitolo_id
+        JOIN capitoli c ON c.id = v.capitolo_id
         WHERE r.materiale_id IN ({})
         ORDER BY c.codice, v.codice
         """.format(",".join(["?"]*len(material_ids)))
-        return pd.read_sql_query(q, con, params=list(material_ids))
+        return pd.read_sql_query(q, con, params=material_ids)
 
 def anteprima_impatti_materiali(material_ids: list[int]) -> pd.DataFrame:
     """
-    Calcola il totale attuale della VOCE (con i prezzi base correnti) e lo
-    confronta con il prezzo di riferimento della voce (se presente).
+    Calcola il nuovo totale voce (con i prezzi correnti) e, se esiste un prezzo_riferimento,
+    mostra lo scostamento percentuale vs riferimento.
     """
     voci_df = voci_impattate_da_materiali(material_ids)
     rows = []
@@ -409,14 +416,6 @@ def anteprima_impatti_materiali(material_ids: list[int]) -> pd.DataFrame:
             "voce_id": int(r.voce_id),
         })
     return pd.DataFrame(rows)
-
-def prezzo_unitario_voce(voce_id: int) -> float:
-    v = get_voce(voce_id)
-    if not v:
-        return 0.0
-    tot = compute_totali_voce(voce_id)["totale"]
-    q = max(float(v["q_voce"]), 1e-9)
-    return tot / q
 
 # ------------------------------------------------------------------
 # Mutations (CRUD)
@@ -440,6 +439,39 @@ def delete_categoria(cid: int):
         con.commit()
         st.success("Categoria eliminata.")
 
+def delete_preventivo(pid: int):
+    with get_con() as con:
+        _exec(con, "DELETE FROM preventivo_righe WHERE preventivo_id=?", (pid,))
+        _exec(con, "DELETE FROM preventivi WHERE id=?", (pid,))
+        con.commit()
+    st.success(f"Preventivo ID {pid} eliminato.")
+
+def update_preventivo_header(pid: int, numero: str, data_iso: str, cliente_id: int, note_finali: str, iva_percent: float):
+    with get_con() as con:
+        _exec(con, """UPDATE preventivi
+                      SET numero=?, data=?, cliente_id=?, note_finali=?, iva_percentuale=?
+                      WHERE id=?""",
+              (numero.strip(), data_iso, int(cliente_id), note_finali, float(iva_percent), int(pid)))
+        con.commit()
+    ricalcola_totali_preventivo(int(pid), iva_percent)
+    st.success("Testata preventivo aggiornata.")
+
+def update_riga_preventivo(riga_id: int, descrizione: str, note: str, um: str, quantita: float, prezzo_unitario: float):
+    tot = float(quantita) * float(prezzo_unitario)
+    with get_con() as con:
+        _exec(con, """UPDATE preventivo_righe
+                      SET descrizione=?, note=?, um=?, quantita=?, prezzo_unitario=?, prezzo_totale=?
+                      WHERE id=?""",
+              (descrizione.strip(), note, um, float(quantita), float(prezzo_unitario), tot, int(riga_id)))
+        con.commit()
+    st.success("Riga preventivo aggiornata.")
+
+def delete_riga_preventivo(riga_id: int):
+    with get_con() as con:
+        _exec(con, "DELETE FROM preventivo_righe WHERE id=?", (int(riga_id),))
+        con.commit()
+    st.success("Riga preventivo eliminata.")
+       
 def add_fornitore(nome, piva, indirizzo, email, telefono):
     """Inserisce un fornitore solo se NON esiste già per Nome (normalizzato) o P.IVA (solo cifre)."""
     nome_n = _norm_text(nome)
@@ -491,22 +523,50 @@ def add_materiale(categoria_id, fornitore_id, codice_fornitore, descrizione, um,
 
 def update_materiali_bulk(df_edit: pd.DataFrame, df_orig: pd.DataFrame):
     changes = []
+    price_changes = []  # (materiale_id, old_price, new_price)
     for _, row in df_edit.iterrows():
         orig = df_orig[df_orig["id"] == row["id"]].iloc[0]
         fields = ["descrizione", "unita_misura", "quantita_default", "prezzo_unitario"]
         updates = {f: row[f] for f in fields if str(row[f]) != str(orig[f])}
         if updates:
             changes.append((int(row["id"]), updates))
+            # log solo per cambio prezzo
+            if "prezzo_unitario" in updates:
+                try:
+                    old_p = float(orig["prezzo_unitario"])
+                    new_p = float(updates["prezzo_unitario"])
+                    if old_p != new_p:
+                        price_changes.append((int(row["id"]), old_p, new_p))
+                except Exception:
+                    pass
+
     if not changes:
         st.info("Nessuna modifica da salvare.")
         return
+
     with get_con() as con:
         for mid, upd in changes:
             sets = ", ".join([f"{k}=?" for k in upd.keys()])
             vals = list(upd.values()) + [mid]
             _exec(con, f"UPDATE materiali_base SET {sets} WHERE id=?", vals)
+
+        # LOG storico prezzi
+        for mid, old_p, new_p in price_changes:
+            _exec(con, """INSERT INTO materiali_prezzi_storico (materiale_id, prezzo_vecchio, prezzo_nuovo, note)
+                          VALUES (?,?,?,?)""", (mid, float(old_p), float(new_p), "Aggiornamento da editor materiali"))
         con.commit()
-    st.success(f"Salvate {len(changes)} modifiche.")
+
+    # Memorizza gli ID materiali il cui PREZZO è cambiato, per l’anteprima impatti
+    if price_changes:
+        st.session_state["last_changed_material_ids"] = [mid for (mid, _, _) in price_changes]
+        st.success(f"Salvate {len(changes)} modifiche (di cui {len(price_changes)} su prezzo).")
+        with st.expander("Anteprima impatti (voci toccate dai materiali aggiornati)"):
+            df_imp = anteprima_impatti_materiali(st.session_state["last_changed_material_ids"])
+            st.caption(f"Voci impattate: {len(df_imp)}")
+            if not df_imp.empty:
+                st.dataframe(df_imp.drop(columns=["voce_id"]), use_container_width=True, hide_index=True, height=320)
+    else:
+        st.success(f"Salvate {len(changes)} modifiche.")
 
 def add_capitolo(codice, nome, cg_def, ut_def):
     try:
@@ -877,18 +937,38 @@ def df_preventivi_archivio(numero_like: str = "", data_like: str = "", cliente_i
         q += " ORDER BY p.data DESC, p.numero DESC"
         return pd.read_sql_query(q, con, params=params)
 
-def export_preventivo_docx(pid: int):
+def export_preventivo_docx(pid: int, logo_path: Optional[str] = None):
     from docx import Document
-    from docx.shared import Pt, Cm
+    from docx.shared import Pt, Cm, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
 
     testa, righe = df_preventivo(pid)
     if testa.empty:
         return None
 
     d = Document()
-    d.add_heading(f"Preventivo {testa['numero'].iloc[0]} del {testa['data'].iloc[0]}", level=1)
 
-    # Cliente
+    # --- Header con logo opzionale ---
+    if logo_path:
+        try:
+            hdr = d.sections[0].header
+            p = hdr.paragraphs[0]
+            run = p.add_run()
+            run.add_picture(logo_path, width=Inches(1.2))
+            p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        except Exception:
+            pass
+
+    # Titolo
+    title = d.add_paragraph()
+    run = title.add_run(f"Preventivo {testa['numero'].iloc[0]} del {testa['data'].iloc[0]}")
+    run.bold = True
+    title.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    d.add_paragraph("")  # spazio
+
+    # Cliente (testo compatto)
     cli = [
         f"Cliente: {testa['cliente_nome'].iloc[0]}",
         f"P.IVA/CF: {testa['piva'].iloc[0] or '-'}",
@@ -898,20 +978,22 @@ def export_preventivo_docx(pid: int):
         f"Email: {testa['email'].iloc[0] or '-'}  Tel: {testa['telefono'].iloc[0] or '-'}",
     ]
     for r in cli:
-        d.add_paragraph(r)
+        p = d.add_paragraph(r)
+        p.paragraph_format.space_after = Pt(2)
 
-    d.add_paragraph("")  # spazio
+    d.add_paragraph("")
 
-    # Tabella righe
+    # Tabella righe (compatta)
     table = d.add_table(rows=1, cols=7)
+    table.style = "Table Grid"
     hdr = table.rows[0].cells
-    hdr[0].text = "Capitolo"
-    hdr[1].text = "Voce"
-    hdr[2].text = "Descrizione"
-    hdr[3].text = "UM"
-    hdr[4].text = "Q.tà"
-    hdr[5].text = "Prezzo U (€)"
-    hdr[6].text = "Totale (€)"
+    headers = ["Capitolo", "Voce", "Descrizione", "UM", "Q.tà", "Prezzo U (€)", "Totale (€)"]
+    for i, h in enumerate(headers):
+        hdr[i].text = h
+
+    for cell in table.rows[0].cells:
+        for paragraph in cell.paragraphs:
+            paragraph.runs[0].font.bold = True
 
     for _, r in righe.iterrows():
         row = table.add_row().cells
@@ -925,38 +1007,59 @@ def export_preventivo_docx(pid: int):
 
         note_val = r["note"] if "note" in r and pd.notna(r["note"]) and str(r["note"]).strip() else ""
         if note_val:
-            d.add_paragraph(f"Note: {note_val}")
+            p = d.add_paragraph(f"Note: {note_val}")
+            p.paragraph_format.left_indent = Cm(0.5)
+            p.paragraph_format.space_after = Pt(2)
+
+    # Larghezze colonne (facoltativo, Word può ignorare su alcuni template)
+    try:
+        widths = [Cm(3.0), Cm(1.6), Cm(8.0), Cm(1.4), Cm(1.6), Cm(2.4), Cm(2.6)]
+        for row in table.rows:
+            for w, cell in zip(widths, row.cells):
+                cell.width = w
+    except Exception:
+        pass
 
     d.add_paragraph("")
 
     # Totali per capitolo
     if not righe.empty:
-        bycap = (righe.groupby(["capitolo_codice","capitolo_nome"])["prezzo_totale"].sum()
-                 .reset_index().rename(columns={"prezzo_totale":"Totale capitolo (€)"}))
+        bycap = (righe.groupby(["capitolo_codice","capitolo_nome"])["prezzo_totale"]
+                 .sum().reset_index().rename(columns={"prezzo_totale":"Totale capitolo (€)"}))
         d.add_paragraph("Totali per capitolo:")
         for _, rr in bycap.iterrows():
-            d.add_paragraph(f"- {rr['capitolo_codice']} {rr['capitolo_nome']}: € {rr['Totale capitolo (€)']:.2f}")
+            p = d.add_paragraph(f"- {rr['capitolo_codice']} {rr['capitolo_nome']}: € {rr['Totale capitolo (€)']:.2f}")
+            p.paragraph_format.space_after = Pt(2)
 
     d.add_paragraph("")
 
-    # Riepilogo documento
+    # Riepilogo documento (in grassetto)
     imp = float(testa["imponibile"].iloc[0])
     iva_p = float(testa["iva_percentuale"].iloc[0])
     iva_imp = float(testa["iva_importo"].iloc[0])
     tot = float(testa["totale"].iloc[0])
 
-    d.add_paragraph(f"Imponibile: € {imp:.2f}")
-    d.add_paragraph(f"IVA {iva_p:.0f}%: € {iva_imp:.2f}")
-    d.add_paragraph(f"Totale documento: € {tot:.2f}")
+    for label, val in [
+        ("Imponibile", f"€ {imp:.2f}"),
+        (f"IVA {iva_p:.0f}%", f"€ {iva_imp:.2f}"),
+        ("Totale documento", f"€ {tot:.2f}"),
+    ]:
+        p = d.add_paragraph()
+        run_label = p.add_run(f"{label}: ")
+        run_label.bold = True
+        p.add_run(val)
 
     if testa["note_finali"].iloc[0]:
         d.add_paragraph("")
-        d.add_paragraph(f"Note finali: {testa['note_finali'].iloc[0]}")
+        p = d.add_paragraph("Note finali:")
+        p.runs[0].bold = True
+        d.add_paragraph(str(testa["note_finali"].iloc[0]))
 
     buf = io.BytesIO()
     d.save(buf)
     buf.seek(0)
     return buf
+
 
 # ------------------------------------------------------------------
 # UI – Categorie
@@ -999,6 +1102,18 @@ def ui_fornitori():
         up = st.file_uploader("Carica .csv o .xlsx", type=["csv","xlsx"], key="up_fornitori")
         if up is not None:
             import_fornitori_csv(up); st.rerun()
+
+    with st.expander("🕘 Storico prezzi materiali"):
+        with get_con() as con:
+            sto = pd.read_sql_query("""
+                SELECT s.changed_at, m.id AS materiale_id, m.descrizione, m.codice_fornitore,
+                       s.prezzo_vecchio, s.prezzo_nuovo, s.note
+                FROM materiali_prezzi_storico s
+                JOIN materiali_base m ON m.id = s.materiale_id
+                ORDER BY s.changed_at DESC
+            """, con)
+        st.dataframe(sto, use_container_width=True, hide_index=True, height=280)
+        
 
     if not df.empty:
         fid = st.selectbox("Elimina fornitore", options=[None]+df["id"].tolist(),
@@ -1099,21 +1214,19 @@ def ui_materiali():
         orig_for_edited = df_all[df_all["id"].isin(edited["id"])]
         update_materiali_bulk(edited, orig_for_edited)
         st.rerun()
-     
-    # Anteprima impatti manuale (se ci sono modifiche prezzo recenti)
+        
+        # Anteprima impatti manuale (se ci sono modifiche prezzo recenti in sessione)
     if st.session_state.get("last_changed_material_ids"):
         if st.button("🔁 Ricalcola/mostra impatti voci colpite"):
             df_imp = anteprima_impatti_materiali(st.session_state["last_changed_material_ids"])
             st.caption(f"Voci impattate: {len(df_imp)}")
             if df_imp.empty:
                 st.info("Nessuna voce legata ai materiali modificati.")
-        else:
-            st.dataframe(
-                df_imp.drop(columns=["voce_id"]),
-                use_container_width=True, hide_index=True, height=380
-            ) 
-            
-               # Import CSV/Excel
+            else:
+                st.dataframe(df_imp.drop(columns=["voce_id"]), use_container_width=True, hide_index=True, height=380)
+
+    # ---------------------------
+    # Import CSV/Excel
     # ---------------------------
     with st.expander("📥 Import materiali da CSV/Excel"):
         st.markdown("Colonne richieste: **categoria, fornitore, codice_fornitore, descrizione, unita_misura, prezzo_unitario** (+ opz. `quantita_default`).")
@@ -1121,18 +1234,7 @@ def ui_materiali():
         if up is not None:
             import_materiali_csv(up)
             st.rerun()
-    with st.expander("🕘 Storico prezzi materiali"):
-        with get_con() as con:
-            df = pd.read_sql_query("""
-                SELECT s.changed_at, m.descrizione AS materiale,
-                       s.prezzo_vecchio, s.prezzo_nuovo, s.note
-                FROM materiali_prezzi_storico s
-                JOIN materiali_base m ON m.id = s.materiale_id
-                ORDER BY s.changed_at DESC
-                LIMIT 200
-            """, con)
-            st.dataframe(df, use_container_width=True, hide_index=True, height=240)
-       
+
 
 # ------------------------------------------------------------------
 # UI – Capitoli
@@ -1624,6 +1726,16 @@ def ui_preventivi():
         note_finali = st.text_area("Note finali (facoltative)")
         iva_percent = st.number_input("IVA %", min_value=0.0, value=22.0, step=1.0)
 
+        # Carica preventivo esistente
+        arch_quick = df_preventivi_archivio()
+        _colL, _colR = st.columns([2,1])
+        pid_pick = _colL.selectbox("Oppure apri un preventivo esistente", options=[0]+arch_quick["id"].tolist(),
+                                   format_func=lambda x: "—" if x==0 else f"ID {x}")
+        if _colR.button("Apri selezionato") and pid_pick:
+            st.session_state["preventivo_corrente"] = int(pid_pick)
+            st.success(f"Aperto preventivo ID {int(pid_pick)} per modifica.")
+            st.rerun()
+
         colh1, colh2 = st.columns([1,1])
         if colh1.button("➕ Crea preventivo"):
             if not (numero and data):
@@ -1638,6 +1750,27 @@ def ui_preventivi():
         pid = st.session_state.get("preventivo_corrente")
         if pid:
             st.caption(f"Preventivo corrente: ID {pid}")
+
+            # Precompila header con i valori correnti
+            testa_cur, _righe_cur = df_preventivo(int(pid))
+            if not testa_cur.empty:
+                # Sovrascrivi i widget con i valori correnti (solo visualmente; per submit usiamo i widget attuali)
+                numero = st.text_input("Numero", value=testa_cur["numero"].iloc[0], key=f"num_{pid}")
+                data = st.text_input("Data (YYYY-MM-DD)", value=testa_cur["data"].iloc[0], key=f"date_{pid}")
+                cliente_id = st.selectbox("Cliente", options=cli["id"],
+                                          index=cli.index[cli["id"]==testa_cur["cliente_id"].iloc[0]][0],
+                                          format_func=lambda i: cli[cli["id"]==i]["nome"].iloc[0], key=f"cli_{pid}")
+                note_finali = st.text_area("Note finali (facoltative)", value=testa_cur["note_finali"].iloc[0] or "", key=f"nf_{pid}")
+                iva_percent = st.number_input("IVA %", min_value=0.0, value=float(testa_cur["iva_percentuale"].iloc[0]), step=1.0, key=f"iva_{pid}")
+
+                c_upd1, c_upd2, c_upd3 = st.columns([1,1,1])
+                if c_upd1.button("💾 Aggiorna testata"):
+                    update_preventivo_header(int(pid), numero, data, int(cliente_id), note_finali, float(iva_percent))
+                    st.rerun()
+                if c_upd2.button("🗑️ Elimina preventivo"):
+                    delete_preventivo(int(pid))
+                    st.session_state.pop("preventivo_corrente", None)
+                    st.rerun()
 
             st.markdown("### Aggiungi righe")
             cap = df_capitoli()
@@ -1679,6 +1812,30 @@ def ui_preventivi():
                 st.markdown("#### Righe inserite")
                 st.dataframe(righe[["capitolo_codice","capitolo_nome","voce_codice","descrizione","um","quantita","prezzo_unitario","prezzo_totale"]],
                              use_container_width=True, hide_index=True)
+                                # Editor righe (semplice): seleziona riga, poi modifica campi principali
+                rid_opts = _righe_cur["id"].tolist() if not _righe_cur.empty else []
+                if rid_opts:
+                    st.markdown("#### Modifica riga esistente")
+                    colr1, colr2 = st.columns([2,1])
+                    rid_sel = colr1.selectbox("Riga", options=rid_opts, format_func=lambda x: f"id {x}")
+                    if rid_sel:
+                        rsel = _righe_cur[_righe_cur["id"]==rid_sel].iloc[0]
+                        desc_e = st.text_input("Descrizione", value=str(rsel["descrizione"]), key=f"desc_e_{rid_sel}")
+                        note_e = st.text_area("Note (facolt.)", value=str(rsel["note"] or ""), key=f"note_e_{rid_sel}")
+                        um_e = st.selectbox("UM", UM_CHOICES,
+                                            index=UM_CHOICES.index(rsel["um"]) if rsel["um"] in UM_CHOICES else 0,
+                                            key=f"um_e_{rid_sel}")
+                        q_e = st.number_input("Quantità", min_value=0.0, value=float(rsel["quantita"]), step=0.1, key=f"q_e_{rid_sel}")
+                        pu_e = st.number_input("Prezzo unitario (€)", min_value=0.0, value=float(rsel["prezzo_unitario"]), step=0.01, format="%.2f", key=f"pu_e_{rid_sel}")
+                        colb1, colb2 = st.columns([1,1])
+                        if colb1.button("💾 Aggiorna riga", key=f"upd_r_{rid_sel}"):
+                            update_riga_preventivo(int(rid_sel), desc_e, note_e, um_e, q_e, pu_e)
+                            ricalcola_totali_preventivo(int(pid), iva_percent)
+                            st.rerun()
+                        if colb2.button("🗑️ Elimina riga", key=f"del_r_{rid_sel}"):
+                            delete_riga_preventivo(int(rid_sel))
+                            ricalcola_totali_preventivo(int(pid), iva_percent)
+                            st.rerun()
 
                 st.markdown("#### Totali per capitolo")
                 by_cap = (righe.groupby(["capitolo_codice","capitolo_nome"])["prezzo_totale"].sum()
@@ -1748,6 +1905,16 @@ def ui_preventivi():
             st.success(f"Preventivo ID {int(pid_open)} aperto qui sotto.")
             st.rerun()
 
+        # Elimina selezionato
+        if pid_open:
+            cdel1, cdel2 = st.columns([1,1])
+            if cdel1.button("🗑️ Elimina preventivo selezionato"):
+                delete_preventivo(int(pid_open))
+                st.rerun()
+            if cdel2.button("✏️ Apri per modifica in 'Nuovo/Modifica'"):
+                st.session_state["preventivo_corrente"] = int(pid_open)
+                st.success("Aperto in 'Nuovo/Modifica'. Vai alla tab corrispondente.")
+    
         # Se c'è un preventivo selezionato/precedente, mostrane i dettagli QUI
         pid_show = st.session_state.get("opened_preventivo_from_archivio")
         if pid_show:
@@ -1781,5 +1948,5 @@ def main():
     elif pagina == "Preventivi":
         ui_preventivi()
 
-if __name__ == "__main__":
-    main()
+    if __name__ == "__main__":
+        main()

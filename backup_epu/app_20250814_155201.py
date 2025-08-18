@@ -197,20 +197,6 @@ def init_db():
             FOREIGN KEY(capitolo_id) REFERENCES capitoli(id),
             FOREIGN KEY(voce_id) REFERENCES voci_analisi(id)
         )""")
-        # Storico prezzi materiali
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS materiali_prezzi_storico (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            materiale_id INTEGER NOT NULL,
-            prezzo_vecchio REAL NOT NULL,
-            prezzo_nuovo REAL NOT NULL,
-            changed_at TEXT NOT NULL DEFAULT (datetime('now')),
-            note TEXT,
-            FOREIGN KEY(materiale_id) REFERENCES materiali_base(id)
-        )""")
-        # Indici storico
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sto_mat  ON materiali_prezzi_storico(materiale_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sto_date ON materiali_prezzi_storico(changed_at)")
 
         con.commit()
 
@@ -369,46 +355,6 @@ def compute_totali_voce(voce_id: int) -> Dict[str, float]:
         "utile_pct": voce["utile_pct"],
         "totale": totale,
     }
-# -------- (2) Impatti da aggiornamento materiali --------
-def voci_impattate_da_materiali(material_ids: list[int]) -> pd.DataFrame:
-    """Ritorna le voci che usano almeno uno dei materiali indicati."""
-    if not material_ids:
-        return pd.DataFrame(columns=["voce_id","capitolo_codice","capitolo_nome","codice","descrizione","prezzo_rif"])
-    with get_con() as con:
-        q = """
-        SELECT DISTINCT v.id AS voce_id,
-               c.codice AS capitolo_codice, c.nome AS capitolo_nome,
-               v.codice, v.descrizione,
-               IFNULL(v.prezzo_riferimento,0.0) AS prezzo_rif
-        FROM righe_distinta r
-        JOIN voci_analisi v ON v.id = r.voce_analisi_id
-        JOIN capitoli c    ON c.id = v.capitolo_id
-        WHERE r.materiale_id IN ({})
-        ORDER BY c.codice, v.codice
-        """.format(",".join(["?"]*len(material_ids)))
-        return pd.read_sql_query(q, con, params=list(material_ids))
-
-def anteprima_impatti_materiali(material_ids: list[int]) -> pd.DataFrame:
-    """
-    Calcola il totale attuale della VOCE (con i prezzi base correnti) e lo
-    confronta con il prezzo di riferimento della voce (se presente).
-    """
-    voci_df = voci_impattate_da_materiali(material_ids)
-    rows = []
-    for _, r in voci_df.iterrows():
-        tot = compute_totali_voce(int(r.voce_id))["totale"]
-        rif = float(r.get("prezzo_rif", 0.0))
-        delta_pct = ((tot - rif) / rif * 100.0) if rif > 0 else None
-        rows.append({
-            "Capitolo": r.capitolo_codice,
-            "Voce": r.codice,
-            "Descrizione": r.descrizione,
-            "Totale attuale (€)": round(tot, 2),
-            "Prezzo riferimento (€)": (round(rif, 2) if rif > 0 else "-"),
-            "Δ vs riferimento (%)": (f"{delta_pct:+.2f}%" if delta_pct is not None else "-"),
-            "voce_id": int(r.voce_id),
-        })
-    return pd.DataFrame(rows)
 
 def prezzo_unitario_voce(voce_id: int) -> float:
     v = get_voce(voce_id)
@@ -1099,21 +1045,9 @@ def ui_materiali():
         orig_for_edited = df_all[df_all["id"].isin(edited["id"])]
         update_materiali_bulk(edited, orig_for_edited)
         st.rerun()
-     
-    # Anteprima impatti manuale (se ci sono modifiche prezzo recenti)
-    if st.session_state.get("last_changed_material_ids"):
-        if st.button("🔁 Ricalcola/mostra impatti voci colpite"):
-            df_imp = anteprima_impatti_materiali(st.session_state["last_changed_material_ids"])
-            st.caption(f"Voci impattate: {len(df_imp)}")
-            if df_imp.empty:
-                st.info("Nessuna voce legata ai materiali modificati.")
-        else:
-            st.dataframe(
-                df_imp.drop(columns=["voce_id"]),
-                use_container_width=True, hide_index=True, height=380
-            ) 
-            
-               # Import CSV/Excel
+
+    # ---------------------------
+    # Import CSV/Excel
     # ---------------------------
     with st.expander("📥 Import materiali da CSV/Excel"):
         st.markdown("Colonne richieste: **categoria, fornitore, codice_fornitore, descrizione, unita_misura, prezzo_unitario** (+ opz. `quantita_default`).")
@@ -1121,18 +1055,7 @@ def ui_materiali():
         if up is not None:
             import_materiali_csv(up)
             st.rerun()
-    with st.expander("🕘 Storico prezzi materiali"):
-        with get_con() as con:
-            df = pd.read_sql_query("""
-                SELECT s.changed_at, m.descrizione AS materiale,
-                       s.prezzo_vecchio, s.prezzo_nuovo, s.note
-                FROM materiali_prezzi_storico s
-                JOIN materiali_base m ON m.id = s.materiale_id
-                ORDER BY s.changed_at DESC
-                LIMIT 200
-            """, con)
-            st.dataframe(df, use_container_width=True, hide_index=True, height=240)
-       
+
 
 # ------------------------------------------------------------------
 # UI – Capitoli

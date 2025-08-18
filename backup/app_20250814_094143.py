@@ -7,11 +7,8 @@
 # - import_materiali_csv(): parsing float robusto (virgole decimali)
 # - export_preventivo_docx(): gestione sicura campo 'note'
 # - Chiavi Streamlit già coerenti in ui_voci()
-# - NEW: CSS per rimuovere “fullscreen” su tabelle, utility testo/filtri, blocco duplicati fornitori,
-#        messaggio capitolo defaults aggiornato
 
 import io
-import re
 import sqlite3
 from contextlib import contextmanager
 from typing import Optional, Dict
@@ -23,22 +20,6 @@ DB_PATH = "epu.db"
 UM_CHOICES = ["Mt", "Mtq2", "Hr", "Nr", "Lt", "GG", "KG", "QL", "AC"]
 
 st.set_page_config(page_title="EPU Builder v1.3.2", layout="wide")
-
-# ------------------------------------------------------------------
-# CSS globale: rimuovi pulsante "View fullscreen" sui dataframe/editor
-# ------------------------------------------------------------------
-_HF_CSS = """
-<style>
-button[kind="header"] svg[aria-label="View fullscreen"] { display: none !important; }
-div[data-testid="stElementToolbar"] button[title="View fullscreen"] { display: none !important; }
-/* Per nascondere tutta la toolbar degli elementi Streamlit, scommenta: */
-/* div[data-testid="stElementToolbar"] { display: none !important; } */
-</style>
-"""
-def inject_global_css():
-    st.markdown(_HF_CSS, unsafe_allow_html=True)
-
-inject_global_css()
 
 # ------------------------------------------------------------------
 # Utils
@@ -56,25 +37,6 @@ def _to_float(x, default=0.0):
         return float(str(x).replace(",", "."))
     except Exception:
         return default
-
-# --- Utility testo/filtri (serviranno anche per i filtri stile Excel) ---
-def _norm_text(x: str) -> str:
-    """minuscolo, spazi singoli, rimuove punteggiatura semplice: utile per confronti su nomi."""
-    if pd.isna(x):
-        return ""
-    x = re.sub(r"[^\w\s]", "", str(x).strip(), flags=re.UNICODE)
-    x = re.sub(r"\s+", " ", x).strip().lower()
-    return x
-
-def _digits_only(x: str) -> str:
-    """solo cifre (es. per P.IVA)."""
-    return re.sub(r"\D", "", str(x or ""))
-
-def like_mask(series: pd.Series, needle: str) -> pd.Series:
-    """Filtro 'contains' case-insensitive; True se needle è vuoto."""
-    if not needle:
-        return pd.Series([True]*len(series))
-    return series.fillna("").astype(str).str.contains(str(needle), case=False, regex=False)
 
 # ------------------------------------------------------------------
 # DB init
@@ -197,20 +159,6 @@ def init_db():
             FOREIGN KEY(capitolo_id) REFERENCES capitoli(id),
             FOREIGN KEY(voce_id) REFERENCES voci_analisi(id)
         )""")
-        # Storico prezzi materiali
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS materiali_prezzi_storico (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            materiale_id INTEGER NOT NULL,
-            prezzo_vecchio REAL NOT NULL,
-            prezzo_nuovo REAL NOT NULL,
-            changed_at TEXT NOT NULL DEFAULT (datetime('now')),
-            note TEXT,
-            FOREIGN KEY(materiale_id) REFERENCES materiali_base(id)
-        )""")
-        # Indici storico
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sto_mat  ON materiali_prezzi_storico(materiale_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sto_date ON materiali_prezzi_storico(changed_at)")
 
         con.commit()
 
@@ -369,46 +317,6 @@ def compute_totali_voce(voce_id: int) -> Dict[str, float]:
         "utile_pct": voce["utile_pct"],
         "totale": totale,
     }
-# -------- (2) Impatti da aggiornamento materiali --------
-def voci_impattate_da_materiali(material_ids: list[int]) -> pd.DataFrame:
-    """Ritorna le voci che usano almeno uno dei materiali indicati."""
-    if not material_ids:
-        return pd.DataFrame(columns=["voce_id","capitolo_codice","capitolo_nome","codice","descrizione","prezzo_rif"])
-    with get_con() as con:
-        q = """
-        SELECT DISTINCT v.id AS voce_id,
-               c.codice AS capitolo_codice, c.nome AS capitolo_nome,
-               v.codice, v.descrizione,
-               IFNULL(v.prezzo_riferimento,0.0) AS prezzo_rif
-        FROM righe_distinta r
-        JOIN voci_analisi v ON v.id = r.voce_analisi_id
-        JOIN capitoli c    ON c.id = v.capitolo_id
-        WHERE r.materiale_id IN ({})
-        ORDER BY c.codice, v.codice
-        """.format(",".join(["?"]*len(material_ids)))
-        return pd.read_sql_query(q, con, params=list(material_ids))
-
-def anteprima_impatti_materiali(material_ids: list[int]) -> pd.DataFrame:
-    """
-    Calcola il totale attuale della VOCE (con i prezzi base correnti) e lo
-    confronta con il prezzo di riferimento della voce (se presente).
-    """
-    voci_df = voci_impattate_da_materiali(material_ids)
-    rows = []
-    for _, r in voci_df.iterrows():
-        tot = compute_totali_voce(int(r.voce_id))["totale"]
-        rif = float(r.get("prezzo_rif", 0.0))
-        delta_pct = ((tot - rif) / rif * 100.0) if rif > 0 else None
-        rows.append({
-            "Capitolo": r.capitolo_codice,
-            "Voce": r.codice,
-            "Descrizione": r.descrizione,
-            "Totale attuale (€)": round(tot, 2),
-            "Prezzo riferimento (€)": (round(rif, 2) if rif > 0 else "-"),
-            "Δ vs riferimento (%)": (f"{delta_pct:+.2f}%" if delta_pct is not None else "-"),
-            "voce_id": int(r.voce_id),
-        })
-    return pd.DataFrame(rows)
 
 def prezzo_unitario_voce(voce_id: int) -> float:
     v = get_voce(voce_id)
@@ -441,30 +349,14 @@ def delete_categoria(cid: int):
         st.success("Categoria eliminata.")
 
 def add_fornitore(nome, piva, indirizzo, email, telefono):
-    """Inserisce un fornitore solo se NON esiste già per Nome (normalizzato) o P.IVA (solo cifre)."""
-    nome_n = _norm_text(nome)
-    piva_n = _digits_only(piva)
-
     with get_con() as con:
-        # Controllo duplicati lato applicativo (robusto contro varianti di spazi/maiuscole/punteggiatura)
-        rows = _exec(con, "SELECT id, nome, piva FROM fornitori").fetchall()
-        for fid, fn, fp in rows:
-            if _norm_text(fn) == nome_n:
-                st.error("Fornitore già esistente: il NOME coincide. Operazione annullata.")
-                return
-            if piva_n and _digits_only(fp) == piva_n:
-                st.error("Fornitore già esistente: la P.IVA coincide. Operazione annullata.")
-                return
-
-        # Inserimento (gestisce anche l'UNIQUE(nome) a schema)
         try:
             _exec(con, """INSERT INTO fornitori (nome,piva,indirizzo,email,telefono)
-                          VALUES (?,?,?,?,?)""",
-                  (nome.strip(), piva, indirizzo, email, telefono))
+                          VALUES (?,?,?,?,?)""", (nome.strip(), piva, indirizzo, email, telefono))
             con.commit()
             st.success("Fornitore aggiunto.")
         except sqlite3.IntegrityError:
-            st.warning("Fornitore già esistente (vincolo su Nome).")
+            st.warning("Fornitore già esistente.")
 
 def delete_fornitore(fid: int):
     with get_con() as con:
@@ -523,7 +415,7 @@ def update_capitolo_defaults(cid: int, cg_def: float, ut_def: float):
         _exec(con, "UPDATE capitoli SET cg_default_percentuale=?, utile_default_percentuale=? WHERE id=?",
               (float(cg_def or 0.0), float(ut_def or 0.0), int(cid)))
         con.commit()
-        st.success("Aggiornati i valori di Spese generali e Utile per il capitolo (influenza nuove voci; le esistenti restano invariate).")
+        st.success("Default aggiornati (influenza nuove voci; le esistenti si modificano singolarmente).")
 
 def delete_capitolo(cid: int):
     with get_con() as con:
@@ -1007,7 +899,7 @@ def ui_fornitori():
             delete_fornitore(int(fid)); st.rerun()
 
 # ------------------------------------------------------------------
-# UI – Materiali (con filtri stile Excel)
+# UI – Materiali
 # ------------------------------------------------------------------
 def ui_materiali():
     st.subheader("Archivio prezzi base (Materiali)")
@@ -1017,122 +909,37 @@ def ui_materiali():
         st.info("Servono almeno 1 Categoria e 1 Fornitore.")
         return
 
-    # ---------------------------
-    # Form inserimento materiale
-    # ---------------------------
     with st.form("form_materiale"):
         c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.2, 1.6])
-        categoria_id = c1.selectbox(
-            "Categoria",
-            options=cat_df["id"],
-            format_func=lambda i: cat_df[cat_df["id"] == i]["nome"].iloc[0],
-            key="mat_cat"
-        )
-        fornitore_id = c2.selectbox(
-            "Fornitore",
-            options=forn_df["id"],
-            format_func=lambda i: forn_df[forn_df["id"] == i]["nome"].iloc[0],
-            key="mat_forn"
-        )
-        codice_fornitore = c3.text_input("Codice fornitore *", key="mat_cod")
-        um = c4.selectbox("UM", UM_CHOICES, key="mat_um")
+        categoria_id = c1.selectbox("Categoria", options=cat_df["id"], format_func=lambda i: cat_df[cat_df["id"]==i]["nome"].iloc[0])
+        fornitore_id = c2.selectbox("Fornitore", options=forn_df["id"], format_func=lambda i: forn_df[forn_df["id"]==i]["nome"].iloc[0])
+        codice_fornitore = c3.text_input("Codice fornitore *")
+        um = c4.selectbox("UM", UM_CHOICES)
 
-        descrizione = st.text_input("Descrizione *", key="mat_desc")
+        descrizione = st.text_input("Descrizione *")
         colq, colp = st.columns(2)
-        qdef = colq.number_input("Quantità default", min_value=0.0, value=1.0, step=1.0, key="mat_qdef")
-        prezzo = colp.number_input("Prezzo unitario (€) *", min_value=0.0, value=0.0, step=0.01, format="%.2f", key="mat_price")
+        qdef = colq.number_input("Quantità default", min_value=0.0, value=1.0, step=1.0)
+        prezzo = colp.number_input("Prezzo unitario (€) *", min_value=0.0, value=0.0, step=0.01, format="%.2f")
 
         if st.form_submit_button("➕ Aggiungi materiale"):
             if not (codice_fornitore and descrizione and prezzo > 0):
                 st.warning("Compila i campi obbligatori contrassegnati con *.")
             else:
-                add_materiale(categoria_id, fornitore_id, codice_fornitore, descrizione, um, qdef, prezzo)
-                st.rerun()
+                add_materiale(categoria_id, fornitore_id, codice_fornitore, descrizione, um, qdef, prezzo); st.rerun()
 
-    # ---------------------------
-    # Tabella + filtri stile Excel
-    # ---------------------------
-    df_all = df_materiali()
-    if df_all is None or df_all.empty:
-        st.info("Nessun materiale in archivio.")
-        return
-
-    # Filtri per colonna (in testa)
-    fc1, fc2, fc3, fc4 = st.columns([1, 1, 1, 2])
-    f_categoria = fc1.text_input("Filtro Categoria", key="flt_mat_categoria")
-    f_fornitore = fc2.text_input("Filtro Fornitore", key="flt_mat_fornitore")
-    f_codforn   = fc3.text_input("Filtro Cod. Fornitore", key="flt_mat_codforn")
-    f_descr     = fc4.text_input("Filtro Descrizione", key="flt_mat_descr")
-
-    dfv = df_all.copy()
-    mask = (
-        like_mask(dfv["categoria"], f_categoria)
-        & like_mask(dfv["fornitore"], f_fornitore)
-        & like_mask(dfv["codice_fornitore"], f_codforn)
-        & like_mask(dfv["descrizione"], f_descr)
-    )
-    dfv = dfv[mask]
-
-    st.caption(f"{len(dfv)} materiali (totale archivio: {len(df_all)})")
-
-    # Vista + editor (solo alcune colonne modificabili)
-    view_cols = ["id","categoria","fornitore","codice_fornitore","descrizione","unita_misura","quantita_default","prezzo_unitario"]
-    view = dfv[view_cols].copy()
-
-    edited = st.data_editor(
-        view,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        column_config={
-            "unita_misura": st.column_config.SelectboxColumn("UM", options=UM_CHOICES),
-            "quantita_default": st.column_config.NumberColumn("quantita_default", step=0.1, min_value=0.0),
-            "prezzo_unitario": st.column_config.NumberColumn("prezzo_unitario", step=0.01, min_value=0.0),
-        },
-        disabled=["id","categoria","fornitore","codice_fornitore"],  # non modificabili
-        height=600,
-        key="mat_editor"
-    )
-
+    df = df_materiali()
+    st.caption(f"{len(df)} materiali")
+    view = df[["id","categoria","fornitore","codice_fornitore","descrizione","unita_misura","quantita_default","prezzo_unitario"]].copy()
+    edited = st.data_editor(view, use_container_width=True, num_rows="fixed",
+                            column_config={"unita_misura": st.column_config.SelectboxColumn("UM", options=UM_CHOICES)})
     if st.button("💾 Salva modifiche materiali"):
-        # Passo il DF originale delle righe visibili (per confronto)
-        orig_for_edited = df_all[df_all["id"].isin(edited["id"])]
-        update_materiali_bulk(edited, orig_for_edited)
-        st.rerun()
-     
-    # Anteprima impatti manuale (se ci sono modifiche prezzo recenti)
-    if st.session_state.get("last_changed_material_ids"):
-        if st.button("🔁 Ricalcola/mostra impatti voci colpite"):
-            df_imp = anteprima_impatti_materiali(st.session_state["last_changed_material_ids"])
-            st.caption(f"Voci impattate: {len(df_imp)}")
-            if df_imp.empty:
-                st.info("Nessuna voce legata ai materiali modificati.")
-        else:
-            st.dataframe(
-                df_imp.drop(columns=["voce_id"]),
-                use_container_width=True, hide_index=True, height=380
-            ) 
-            
-               # Import CSV/Excel
-    # ---------------------------
+        update_materiali_bulk(edited, view); st.rerun()
+
     with st.expander("📥 Import materiali da CSV/Excel"):
         st.markdown("Colonne richieste: **categoria, fornitore, codice_fornitore, descrizione, unita_misura, prezzo_unitario** (+ opz. `quantita_default`).")
         up = st.file_uploader("Carica file .csv o .xlsx", type=["csv","xlsx"], key="up_materiali")
         if up is not None:
-            import_materiali_csv(up)
-            st.rerun()
-    with st.expander("🕘 Storico prezzi materiali"):
-        with get_con() as con:
-            df = pd.read_sql_query("""
-                SELECT s.changed_at, m.descrizione AS materiale,
-                       s.prezzo_vecchio, s.prezzo_nuovo, s.note
-                FROM materiali_prezzi_storico s
-                JOIN materiali_base m ON m.id = s.materiale_id
-                ORDER BY s.changed_at DESC
-                LIMIT 200
-            """, con)
-            st.dataframe(df, use_container_width=True, hide_index=True, height=240)
-       
+            import_materiali_csv(up); st.rerun()
 
 # ------------------------------------------------------------------
 # UI – Capitoli
@@ -1175,7 +982,7 @@ def ui_capitoli():
             delete_capitolo(int(del_id)); st.rerun()
 
 # ------------------------------------------------------------------
-# UI – Voci di analisi (con filtri Capitolo+Descrizione e chiavi coerenti)
+# UI – Voci di analisi
 # ------------------------------------------------------------------
 def ui_voci():
     st.subheader("Voci di analisi")
@@ -1197,12 +1004,7 @@ def ui_voci():
         c1, c2 = st.columns([2, 3])
 
         cap_map = {int(r.id): f"{r.codice} – {r.nome}" for _, r in cap.iterrows()}
-        capitolo_id = c1.selectbox(
-            "Capitolo",
-            options=list(cap_map.keys()),
-            format_func=lambda x: cap_map[x],
-            key="capitolo_per_voce"  # key dedicata
-        )
+        capitolo_id = c1.selectbox("Capitolo", options=list(cap_map.keys()), format_func=lambda x: cap_map[x])
 
         rowc = cap[cap["id"] == capitolo_id].iloc[0]
         cg_def, ut_def = float(rowc["cg_def"]), float(rowc["ut_def"])
@@ -1237,30 +1039,28 @@ def ui_voci():
                 st.rerun()
 
     # -----------------------------
-    # FILTRO per capitolo (dropdown) + filtri stile Excel
+    # FILTRI elenco voci
     # -----------------------------
     cap_map = {int(r.id): f"{r.codice} – {r.nome}" for _, r in cap.iterrows()}
-    filtro_list = st.selectbox(
+    filtro = st.selectbox(
         "Filtra per capitolo",
         options=[0] + list(cap_map.keys()),
-        format_func=lambda x: "Tutti" if x == 0 else cap_map[x],
-        key="filtro_cap_list"  # key dedicata
+        format_func=lambda x: "Tutti" if x == 0 else cap_map[x]
     )
 
-    voci = df_voci(None if filtro_list == 0 else filtro_list)
+    voci = df_voci(None if filtro == 0 else filtro)
     if voci.empty:
         st.info("Nessuna voce trovata.")
         return
 
-    # Filtri stile Excel: Capitolo (codice+nome) + Descrizione
-    fv1, fv2 = st.columns([1.6, 2])
-    f_cap  = fv1.text_input("Filtro Capitolo (codice/nome)", key="flt_voci_cap")
-    f_desc = fv2.text_input("Filtro Descrizione", key="flt_voci_desc")
-
-    vv = voci.copy()
-    cap_full = vv["capitolo_codice"].astype(str) + " " + vv["capitolo_nome"].astype(str)
-    mask = like_mask(cap_full, f_cap) & like_mask(vv["descrizione"], f_desc)
-    vv = vv[mask]
+    # Filtro testuale su codice/descrizione
+    query = st.text_input("Cerca (codice o descrizione)", placeholder="Es. 01 oppure recinzione")
+    if query:
+        q = query.strip().lower()
+        voci = voci[
+            voci["codice"].astype(str).str.lower().str.contains(q) |
+            voci["descrizione"].astype(str).str.lower().str.contains(q)
+        ]
 
     # -----------------------------
     # Lista a sinistra, dettaglio a destra
@@ -1270,24 +1070,20 @@ def ui_voci():
     with left:
         st.write("Voci disponibili")
         st.dataframe(
-            vv.rename(columns={
-                "cg_pct": "CG %", "utile_pct": "Utile %", "um_voce": "UM Voce", "q_voce": "Q.tà Voce"
-            })[
-                ["id", "capitolo_codice", "capitolo_nome", "codice", "descrizione", "UM Voce", "Q.tà Voce", "CG %", "Utile %"]
-            ],
-            use_container_width=True, hide_index=True, height=620  # +scroll (>> 3 righe)
+            voci.rename(columns={"cg_pct": "CG %", "utile_pct": "Utile %", "um_voce": "UM Voce", "q_voce": "Q.tà Voce"})
+                 [["id", "capitolo_codice", "codice", "descrizione", "UM Voce", "Q.tà Voce", "CG %", "Utile %"]],
+            use_container_width=True, hide_index=True, height=320
         )
 
-        ids = vv["id"].tolist()
-        labels = [f"{r.capitolo_codice} {r.codice} – {r.descrizione[:50]}" for _, r in vv.iterrows()]
+        ids = voci["id"].tolist()
+        labels = [f"{r.capitolo_codice} {r.codice} – {r.descrizione[:50]}" for _, r in voci.iterrows()]
         voce_sel = st.selectbox(
             "Seleziona voce",
             options=[None] + ids,
-            format_func=lambda x: "—" if x is None else labels[ids.index(x)],
-            key="voce_sel_list"  # key dedicata
+            format_func=lambda x: "—" if x is None else labels[ids.index(x)]
         )
 
-        colA, colB, _ = st.columns(3)
+        colA, colB, colC = st.columns(3)
         if voce_sel and colA.button("🗑️ Elimina voce"):
             delete_voce(int(voce_sel))
             st.rerun()
@@ -1304,14 +1100,11 @@ def ui_voci():
             c1, c2, c3, c4, c5 = st.columns(5)
             new_cg = c1.number_input("Spese generali (%)", min_value=0.0, value=float(v["cg_pct"]), step=0.5, key=f"cg_{voce_sel}")
             new_ut = c2.number_input("Utile impresa (%)", min_value=0.0, value=float(v["utile_pct"]), step=0.5, key=f"ut_{voce_sel}")
-            new_um = c3.selectbox("UM Voce", UM_CHOICES,
-                                  index=UM_CHOICES.index(v["um_voce"]) if v["um_voce"] in UM_CHOICES else 0,
-                                  key=f"um_{voce_sel}")
+            new_um = c3.selectbox("UM Voce", UM_CHOICES, index=UM_CHOICES.index(v["um_voce"]) if v["um_voce"] in UM_CHOICES else 0, key=f"um_{voce_sel}")
             new_qv = c4.number_input("Q.tà Voce", min_value=0.0, value=float(v["q_voce"]), step=0.1, key=f"qv_{voce_sel}")
-            new_prezzo_rif = c5.number_input("Prezzo di riferimento", min_value=0.0,
-                                             value=float(v.get("prezzo_rif", 0.0)), step=0.01, format="%.2f")
+            new_prezzo_rif = c5.number_input("Prezzo di riferimento", min_value=0.0, value=float(v.get("prezzo_rif", 0.0)), step=0.01, format="%.2f")
 
-            if c5.button("💾 Aggiorna voce", key=f"upd_{voce_sel}"):
+            if c5.button("💾 Aggiorna voce"):
                 update_voce_perc_umqty(int(voce_sel), new_cg, new_ut, new_um, new_qv, new_prezzo_rif)
                 st.rerun()
 
@@ -1319,23 +1112,9 @@ def ui_voci():
             st.write("Distinta base – aggiungi riga")
 
             mats = df_materiali()
-            mat_map = {int(r.id): f"{r.categoria} | {r.fornitore} | {r.codice_fornitore} – {str(r.descrizione)[:50]}"
-                       for _, r in mats.iterrows()}
+            mat_map = {int(r.id): f"{r.categoria} | {r.fornitore} | {r.codice_fornitore} – {r.descrizione[:50]}" for _, r in mats.iterrows()}
             co1, co2, co3 = st.columns([3, 1, 1])
-
-            # piccola ricerca rapida sul select dei materiali
-            search = st.text_input("Cerca materiale (categoria/fornitore/codice/descrizione)", key=f"search_{voce_sel}")
-            filtered_ids = list(mat_map.keys())
-            if search:
-                s = search.strip().lower()
-                def match(txt): return s in str(txt).lower()
-                filtered_ids = [mid for mid in mat_map if match(mat_map[mid])]
-                if not filtered_ids:
-                    st.info("Nessun materiale corrispondente alla ricerca.")
-                    filtered_ids = list(mat_map.keys())
-
-            mat_id = co1.selectbox("Materiale", options=filtered_ids,
-                                   format_func=lambda x: mat_map[x], key=f"m_{voce_sel}")
+            mat_id = co1.selectbox("Materiale", options=list(mat_map.keys()), format_func=lambda x: mat_map[x], key=f"m_{voce_sel}")
             qta = co2.number_input("Quantità", min_value=0.0, value=1.0, step=0.1, key=f"q_{voce_sel}")
             if co3.button("➕ Aggiungi", key=f"add_{voce_sel}"):
                 if qta <= 0:
@@ -1358,12 +1137,11 @@ def ui_voci():
                     column_config={"quantita": st.column_config.NumberColumn("quantita", step=0.1)}
                 )
                 colx, coly = st.columns([1, 1])
-                if colx.button("💾 Salva quantità modificate", key=f"saveq_{voce_sel}"):
+                if colx.button("💾 Salva quantità modificate"):
                     update_quantita_righe(int(voce_sel), edited, view)
                     st.rerun()
-                rid = coly.selectbox("Elimina riga", options=[None] + righe["id"].tolist(),
-                                     format_func=lambda x: "—" if x is None else f"riga #{x}", key=f"delrow_{voce_sel}")
-                if rid and st.button("Elimina selezionata", key=f"btn_del_{voce_sel}"):
+                rid = coly.selectbox("Elimina riga", options=[None] + righe["id"].tolist(), format_func=lambda x: "—" if x is None else f"riga #{x}")
+                if rid and st.button("Elimina selezionata"):
                     delete_riga(int(rid))
                     st.rerun()
 
@@ -1382,9 +1160,8 @@ def ui_voci():
             else:
                 st.caption("Prezzo di riferimento non impostato.")
 
-
 # ------------------------------------------------------------------
-# UI – Sommario EPU (con filtri Capitolo+Descrizione) + export
+# UI – Sommario EPU (a livelli, Capitolo senza totali) + export
 # ------------------------------------------------------------------
 def ui_sommario():
     st.subheader("Sommario EPU")
@@ -1394,15 +1171,13 @@ def ui_sommario():
         st.info("Nessuna voce disponibile.")
         return
 
-    # -----------------------------
-    # Costruzione tabella sintetica
-    # -----------------------------
+    # Tabella sintetica
     rows = []
     for _, r in voci.iterrows():
         tot = compute_totali_voce(int(r.id))
         rows.append({
-            "Capitolo": r.capitolo_codice,     # codice
-            "CapitoloNome": r.capitolo_nome,   # nome
+            "Capitolo": r.capitolo_codice,
+            "CapitoloNome": r.capitolo_nome,
             "Cod. Voce": r.codice,
             "Descrizione": r.descrizione,
             "UM Voce": r.um_voce,
@@ -1415,77 +1190,31 @@ def ui_sommario():
             "Totale (€)": round(tot["totale"], 2),
             "voce_id": int(r.id),
         })
-    df_sum = pd.DataFrame(rows).sort_values(["Capitolo", "Cod. Voce"]).reset_index(drop=True)
+    df_sum = pd.DataFrame(rows).sort_values(["Capitolo","Cod. Voce"])
+    st.dataframe(df_sum.drop(columns=["voce_id","CapitoloNome"]), use_container_width=True, hide_index=True)
 
-    # -----------------------------
-    # Filtri "stile Excel"
-    # -----------------------------
-    f1, f2 = st.columns([1.6, 2])
-    filtro_cap = f1.text_input("Filtro Capitolo (codice o nome)", key="flt_som_cap")
-    filtro_desc = f2.text_input("Filtro Descrizione", key="flt_som_desc")
-
-    if filtro_cap:
-        cap_query = filtro_cap.strip().lower()
-        cap_full = (df_sum["Capitolo"].astype(str) + " " + df_sum["CapitoloNome"].astype(str)).str.lower()
-        df_sum = df_sum[cap_full.str.contains(cap_query, na=False)]
-
-    if filtro_desc:
-        desc_query = filtro_desc.strip().lower()
-        df_sum = df_sum[df_sum["Descrizione"].astype(str).str.lower().str.contains(desc_query, na=False)]
-
-    # -----------------------------
-    # Tabella principale
-    # -----------------------------
-    st.caption(f"Voci in elenco: {len(df_sum)}")
-    st.dataframe(
-        df_sum.drop(columns=["voce_id"]),  # mostro anche Capitolo + Nome
-        use_container_width=True,
-        hide_index=True,
-        height=420  # scrollbar per elenchi lunghi
-    )
-
-    # -----------------------------
-    # Dettaglio a livelli (con scroll)
-    # -----------------------------
     st.markdown("### Dettaglio a livelli")
-    for (cap_code, cap_name), grp in df_sum.groupby(["Capitolo", "CapitoloNome"], sort=False):
+    for (cap_code, cap_name), grp in df_sum.groupby(["Capitolo","CapitoloNome"]):
         with st.expander(f"📁 Capitolo {cap_code} — {cap_name} | Voci: {len(grp)}", expanded=False):
-            # elenco voci completo; nessun limite a 3 — verranno mostrate tutte
+            # Nessun totale a livello capitolo
             for _, r in grp.iterrows():
-                titolo_voce = (
-                    f"🧩 Voce {r['Cod. Voce']} – {r['Descrizione']} "
-                    f"({r['Q.tà Voce']} {r['UM Voce']}) | Totale € {r['Totale (€)']:.2f}"
-                )
+                titolo_voce = f"🧩 Voce {r['Cod. Voce']} – {r['Descrizione']} ({r['Q.tà Voce']} {r['UM Voce']}) | Totale € {r['Totale (€)']:.2f}"
                 with st.expander(titolo_voce, expanded=False):
                     righe = df_righe(int(r["voce_id"]))
                     if righe.empty:
                         st.info("Nessuna riga.")
                     else:
-                        show = righe[[
-                            "categoria", "fornitore", "codice_fornitore",
-                            "materiale_descrizione", "unita_misura",
-                            "prezzo_unitario", "quantita", "subtotale"
-                        ]]
-                        # height alto -> scrollbar interna, utile se tante righe
-                        st.dataframe(show, use_container_width=True, hide_index=True, height=320)
+                        show = righe[["categoria","fornitore","codice_fornitore","materiale_descrizione",
+                                      "unita_misura","prezzo_unitario","quantita","subtotale"]]
+                        st.dataframe(show, use_container_width=True, hide_index=True)
+                    st.caption(f"Materie € {r['Materie (€)']:.2f} | Spese generali € {r['Spese generali (€)']:.2f} | Utile € {r['Utile (€)']:.2f}")
 
-                    st.caption(
-                        f"Materie € {r['Materie (€)']:.2f} | "
-                        f"Spese generali € {r['Spese generali (€)']:.2f} | "
-                        f"Utile € {r['Utile (€)']:.2f}"
-                    )
-
-    # -----------------------------
-    # Export Excel (Sommario EPU)
-    # -----------------------------
+    # Export Excel (solo Sommario EPU + Nome Capitolo)
     buf = export_excel()
     if buf:
-        st.download_button(
-            "⬇️ Esporta Excel (Sommario EPU)",
-            data=buf.getvalue(),
-            file_name="EPU_sommario.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        st.download_button("⬇️ Esporta Excel (Sommario EPU)", data=buf.getvalue(),
+                           file_name="EPU_sommario.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ------------------------------------------------------------------
 # UI – Clienti (riusata nella pagina Preventivi)
