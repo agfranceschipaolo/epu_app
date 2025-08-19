@@ -211,6 +211,18 @@ def init_db():
         # Indici storico
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sto_mat  ON materiali_prezzi_storico(materiale_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_sto_date ON materiali_prezzi_storico(changed_at)")
+        # Trigger: logga i cambi prezzo dei materiali
+        cur.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_log_prezzo_materiale
+        AFTER UPDATE OF prezzo_unitario ON materiali_base
+        FOR EACH ROW
+        WHEN NEW.prezzo_unitario IS NOT OLD.prezzo_unitario
+        BEGIN
+            INSERT INTO materiali_prezzi_storico (materiale_id, prezzo_vecchio, prezzo_nuovo, changed_at, note)
+            VALUES (OLD.id, OLD.prezzo_unitario, NEW.prezzo_unitario, datetime('now'), 'Update da UI materiali');
+        END;
+        """)
+
 
         con.commit()
 
