@@ -42,12 +42,13 @@ def get_engine():
 # Mostra ambiente in sidebar
 # -----------------------------
 env = st.secrets.get("ENV", "dev")
-with st.sidebar:
-    st.markdown(f"**Ambiente:** `{env}`")
-    if env == "prod":
-        st.warning("⚠️ PRODUZIONE")
-    else:
-        st.info("🧪 SVILUPPO (DEV)")
+
+if env == "prod":
+    st.sidebar.success("🚀 PRODUZIONE")
+else:
+    st.sidebar.warning("🧪 SVILUPPO (DEV)")
+
+st.sidebar.markdown(f"**Ambiente attivo:** `{env}`")
 
 # ------------------------------------------------------------------
 # CSS globale: rimuovi pulsante "View fullscreen" sui dataframe/editor
