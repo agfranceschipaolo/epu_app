@@ -13,30 +13,68 @@ from sqlalchemy import create_engine, text
 # -----------------------------
 # Configurazione base
 # -----------------------------
+import os
+from sqlalchemy import create_engine, event  # se NON usi SQLAlchemy, puoi rimuovere questa import
+import streamlit as st
+
 UM_CHOICES = ["Mt", "Mtq2", "Hr", "Nr", "Lt", "GG", "KG", "QL", "AC"]
 
-DB_PATH = "epu.db"  # database locale SQLite
+# Risolvi il percorso DB in modo robusto: secrets -> env -> default
+DB_PATH = (
+    st.secrets.get("SQLITE_PATH")
+    if hasattr(st, "secrets") else None
+) or os.getenv("SQLITE_PATH") or "epu.db"
 
 # ⚠️ va chiamato subito
 st.set_page_config(page_title="EPU Builder v1.3.2", layout="wide")
 
+
 # -----------------------------
-# Connessione DB con SQLAlchemy
+# Connessione DB (sqlite3) - usata da get_con()
+# -----------------------------
+# Il resto dell'app usa già sqlite3 via get_con() con DB_PATH,
+# quindi è sufficiente che DB_PATH sia risolto correttamente qui sopra.
+# Esempio (già presente altrove nel tuo codice):
+#
+# @contextmanager
+# def get_con():
+#     con = sqlite3.connect(DB_PATH)
+#     try:
+#         con.execute("PRAGMA foreign_keys = ON")
+#         yield con
+#     finally:
+#         con.close()
+
+
+# -----------------------------
+# (Opzionale) Connessione DB via SQLAlchemy
 # -----------------------------
 def get_engine():
-    if "DATABASE_URL" in st.secrets:
-        return create_engine(
+    """
+    Usa DATABASE_URL se presente nei secrets (es. Postgres),
+    altrimenti usa SQLite puntando al DB_PATH risolto sopra.
+    Imposta anche PRAGMA foreign_keys=ON su SQLite.
+    """
+    if hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
+        eng = create_engine(
             st.secrets["DATABASE_URL"],
             pool_pre_ping=True,
             pool_recycle=1800,
         )
-    elif "SQLITE_PATH" in st.secrets:
-        sqlite_url = f"sqlite:///{st.secrets['SQLITE_PATH']}"
-        return create_engine(sqlite_url)
     else:
-        # fallback: usa il file locale se presente
         sqlite_url = f"sqlite:///{DB_PATH}"
-        return create_engine(sqlite_url)
+        eng = create_engine(sqlite_url)
+
+    # Abilita FK su SQLite
+    if eng.url.get_backend_name() == "sqlite":
+        @event.listens_for(eng, "connect")
+        def set_sqlite_pragma(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys = ON")
+            cursor.close()
+
+    return eng
+
 
 # -----------------------------
 # Mostra ambiente in sidebar
@@ -140,6 +178,13 @@ def init_db():
             FOREIGN KEY(fornitore_id) REFERENCES fornitori(id),
             UNIQUE(fornitore_id, codice_fornitore)
         )""")
+        # MIGRA: aggiunge la colonna is_manodopera se manca
+        try:
+            cur.execute(
+                "ALTER TABLE materiali_base ADD COLUMN is_manodopera INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # già presente
 
         # Capitoli con default %SG e %Utile
         cur.execute("""
@@ -279,6 +324,15 @@ def get_con():
     finally:
         con.close()
 
+def ensure_is_manodopera_column():
+    # Crea la colonna se manca, senza rompere nulla se già c’è
+    with get_con() as con:
+        cols = [r[1] for r in _exec(con, "PRAGMA table_info(materiali_base)").fetchall()]
+        if "is_manodopera" not in cols:
+            _exec(con, "ALTER TABLE materiali_base ADD COLUMN is_manodopera INTEGER NOT NULL DEFAULT 0")
+            con.commit()
+       
+
 # ------------------------------------------------------------------
 # Query helpers
 # ------------------------------------------------------------------
@@ -293,18 +347,26 @@ def df_fornitori():
 
 def df_materiali():
     with get_con() as con:
-        return pd.read_sql_query("""
+        sql = """
             SELECT m.id,
                    m.categoria_id, c.nome AS categoria,
                    m.fornitore_id, f.nome AS fornitore,
                    m.codice_fornitore, m.descrizione, m.unita_misura,
                    IFNULL(m.quantita_default,1.0) AS quantita_default,
-                   m.prezzo_unitario
+                   m.prezzo_unitario,
+                   IFNULL(m.is_manodopera,0) AS is_manodopera
             FROM materiali_base m
             JOIN categorie c  ON c.id = m.categoria_id
             JOIN fornitori f  ON f.id = m.fornitore_id
             ORDER BY c.nome, f.nome, m.codice_fornitore
-        """, con)
+        """
+        try:
+            return pd.read_sql_query(sql, con)
+        except Exception as e:
+            if "no such column" in str(e).lower() and "is_manodopera" in str(e).lower():
+                ensure_is_manodopera_column()
+                return pd.read_sql_query(sql, con)
+            raise
 
 def df_capitoli():
     with get_con() as con:
@@ -354,6 +416,7 @@ def df_righe(voce_id: int):
                    m.descrizione AS materiale_descrizione,
                    m.unita_misura, m.prezzo_unitario,
                    c.nome AS categoria, f.nome AS fornitore, m.codice_fornitore,
+                   IFNULL(m.is_manodopera,0) AS is_manodopera,
                    (r.quantita * m.prezzo_unitario) AS subtotale
             FROM righe_distinta r
             JOIN materiali_base m ON m.id = r.materiale_id
@@ -393,20 +456,50 @@ def get_voce(voce_id: int) -> Optional[dict]:
 # ------------------------------------------------------------------
 def compute_totali_voce(voce_id: int) -> Dict[str, float]:
     df = df_righe(voce_id)
-    costo_materie = float(df["subtotale"].sum()) if not df.empty else 0.0
+
+    if df.empty:
+        voce = get_voce(voce_id) or {"cg_pct": 0.0, "utile_pct": 0.0}
+        return {
+            "costo_materie": 0.0,
+            "costo_manodopera": 0.0,
+            "costi_generali": 0.0,
+            "utile": 0.0,
+            "cg_pct": voce["cg_pct"],
+            "utile_pct": voce["utile_pct"],
+            "totale": 0.0,
+            "diretto": 0.0,
+        }
+
+    # split diretto
+    mat_mask = df["is_manodopera"].fillna(0).astype(int) == 0
+    mdo_mask = ~mat_mask
+
+    costo_materie = float(df.loc[mat_mask, "subtotale"].sum()) if (mat_mask.any()) else 0.0
+    costo_manodopera = float(df.loc[mdo_mask, "subtotale"].sum()) if (mdo_mask.any()) else 0.0
+
+    diretto = costo_materie + costo_manodopera
+
     voce = get_voce(voce_id) or {"cg_pct": 0.0, "utile_pct": 0.0}
-    cg = costo_materie * (voce["cg_pct"] / 100.0)
-    base = costo_materie + cg
-    utile = base * (voce["utile_pct"] / 100.0)
+    cg_pct = float(voce["cg_pct"])
+    ut_pct = float(voce["utile_pct"])
+
+    # ⬇️ come richiesto: CG% sul totale diretto (materie+mdo), Utile su (diretto+CG)
+    cg = diretto * (cg_pct / 100.0)
+    base = diretto + cg
+    utile = base * (ut_pct / 100.0)
     totale = base + utile
+
     return {
         "costo_materie": costo_materie,
+        "costo_manodopera": costo_manodopera,
         "costi_generali": cg,
         "utile": utile,
-        "cg_pct": voce["cg_pct"],
-        "utile_pct": voce["utile_pct"],
+        "cg_pct": cg_pct,
+        "utile_pct": ut_pct,
         "totale": totale,
+        "diretto": diretto,
     }
+
 # -------- (2) Impatti da aggiornamento materiali --------
 def voci_impattate_da_materiali(material_ids: list[int]) -> pd.DataFrame:
     """Ritorna le voci che usano almeno uno dei materiali indicati."""
@@ -514,27 +607,38 @@ def delete_fornitore(fid: int):
         con.commit()
         st.success("Fornitore eliminato.")
 
-def add_materiale(categoria_id, fornitore_id, codice_fornitore, descrizione, um, qdef, prezzo):
+def add_materiale(categoria_id, fornitore_id, codice_fornitore, descrizione, um, qdef, prezzo, is_manodopera=0):
     try:
         with get_con() as con:
             _exec(con, """
-                INSERT INTO materiali_base (categoria_id, fornitore_id, codice_fornitore, descrizione, unita_misura, quantita_default, prezzo_unitario)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO materiali_base (categoria_id, fornitore_id, codice_fornitore, descrizione, unita_misura, quantita_default, prezzo_unitario, is_manodopera)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (int(categoria_id), int(fornitore_id), codice_fornitore.strip(), descrizione.strip(),
-                  um, float(qdef or 1.0), float(prezzo)))
+                  um, float(qdef or 1.0), float(prezzo), int(bool(is_manodopera))))
             con.commit()
             st.success("Materiale inserito.")
     except sqlite3.IntegrityError:
         st.error("Codice fornitore già presente per questo fornitore.")
 
+
 def update_materiali_bulk(df_edit: pd.DataFrame, df_orig: pd.DataFrame):
     changes = []
     for _, row in df_edit.iterrows():
         orig = df_orig[df_orig["id"] == row["id"]].iloc[0]
-        fields = ["descrizione", "unita_misura", "quantita_default", "prezzo_unitario"]
-        updates = {f: row[f] for f in fields if str(row[f]) != str(orig[f])}
+        fields = ["descrizione", "unita_misura", "quantita_default", "prezzo_unitario", "is_manodopera"]  # ⬅️ aggiunto
+        updates = {}
+        for f in fields:
+            nv = row[f]
+            ov = orig[f]
+            if f == "is_manodopera":
+                nv = int(bool(nv))
+                ov = int(bool(ov))
+            if str(nv) != str(ov):
+                updates[f] = nv
         if updates:
             changes.append((int(row["id"]), updates))
+    ...
+
     if not changes:
         st.info("Nessuna modifica da salvare.")
         return
@@ -793,6 +897,7 @@ def export_excel():  # SOLO Sommario EPU con Nome Capitolo (come richiesto)
                 "CG %": r.cg_pct,
                 "Utile %": r.utile_pct,
                 "Materie (€)": round(tot["costo_materie"], 2),
+                "Manodopera (€)": round(tot["costo_manodopera"], 2),
                 "Spese generali (€)": round(tot["costi_generali"], 2),
                 "Utile (€)": round(tot["utile"], 2),
                 "Totale (€)": round(tot["totale"], 2),
@@ -916,11 +1021,12 @@ def df_preventivi_archivio(numero_like: str = "", data_like: str = "", cliente_i
         return pd.read_sql_query(q, con, params=params)
 
 def export_preventivo_docx(pid: int):
-    from docx import Document
-    from docx.shared import Pt, Cm
-
-    testa, righe = df_preventivo(pid)
-    if testa.empty:
+    try:
+        from docx import Document
+        from docx.shared import Pt, Cm
+    except ModuleNotFoundError:
+        # Modulo non presente: avvisa e disabilita l'export DOCX
+        st.warning("Export DOCX non disponibile: installa il pacchetto 'python-docx' (requirements.txt).")
         return None
 
     d = Document()
@@ -1080,12 +1186,15 @@ def ui_materiali():
         qdef = colq.number_input("Quantità default", min_value=0.0, value=1.0, step=1.0, key="mat_qdef")
         prezzo = colp.number_input("Prezzo unitario (€) *", min_value=0.0, value=0.0, step=0.01, format="%.2f", key="mat_price")
 
+        is_mdo = st.checkbox("È manodopera (MDO)", value=False, key="mat_is_mdo")  # ⬅️ NUOVO
+
         if st.form_submit_button("➕ Aggiungi materiale"):
             if not (codice_fornitore and descrizione and prezzo > 0):
                 st.warning("Compila i campi obbligatori contrassegnati con *.")
             else:
-                add_materiale(categoria_id, fornitore_id, codice_fornitore, descrizione, um, qdef, prezzo)
+                add_materiale(categoria_id, fornitore_id, codice_fornitore, descrizione, um, qdef, prezzo, int(bool(is_mdo)))
                 st.rerun()
+
 
     # ---------------------------
     # Tabella + filtri stile Excel
@@ -1114,7 +1223,7 @@ def ui_materiali():
     st.caption(f"{len(dfv)} materiali (totale archivio: {len(df_all)})")
 
     # Vista + editor (solo alcune colonne modificabili)
-    view_cols = ["id","categoria","fornitore","codice_fornitore","descrizione","unita_misura","quantita_default","prezzo_unitario"]
+    view_cols = ["id","categoria","fornitore","codice_fornitore","descrizione","unita_misura","quantita_default","prezzo_unitario","is_manodopera"]
     view = dfv[view_cols].copy()
 
     edited = st.data_editor(
@@ -1126,11 +1235,13 @@ def ui_materiali():
             "unita_misura": st.column_config.SelectboxColumn("UM", options=UM_CHOICES),
             "quantita_default": st.column_config.NumberColumn("quantita_default", step=0.1, min_value=0.0),
             "prezzo_unitario": st.column_config.NumberColumn("prezzo_unitario", step=0.01, min_value=0.0),
+            "is_manodopera": st.column_config.CheckboxColumn("È manodopera"),  # ⬅️ NUOVO
         },
-        disabled=["id","categoria","fornitore","codice_fornitore"],  # non modificabili
+        disabled=["id","categoria","fornitore","codice_fornitore"],  # ⬅️ NOTA: is_manodopera ora è editabile
         height=600,
         key="mat_editor"
     )
+
 
     if st.button("💾 Salva modifiche materiali"):
         # Passo il DF originale delle righe visibili (per confronto)
@@ -1151,14 +1262,15 @@ def ui_materiali():
                 use_container_width=True, hide_index=True, height=380
             ) 
             
-               # Import CSV/Excel
+            # Import CSV/Excel
     # ---------------------------
     with st.expander("📥 Import materiali da CSV/Excel"):
-        st.markdown("Colonne richieste: **categoria, fornitore, codice_fornitore, descrizione, unita_misura, prezzo_unitario** (+ opz. `quantita_default`).")
+        st.markdown("Colonne richieste: **categoria, fornitore, codice_fornitore, descrizione, unita_misura, prezzo_unitario** (+ opz. `quantita_default`, `is_manodopera`).")
         up = st.file_uploader("Carica file .csv o .xlsx", type=["csv","xlsx"], key="up_materiali")
         if up is not None:
             import_materiali_csv(up)
             st.rerun()
+
     with st.expander("🕘 Storico prezzi materiali"):
         with get_con() as con:
             df = pd.read_sql_query("""
@@ -1170,7 +1282,63 @@ def ui_materiali():
                 LIMIT 200
             """, con)
             st.dataframe(df, use_container_width=True, hide_index=True, height=240)
-       
+
+# ------------------------------------------------------------------
+# Funzione import CSV/Excel con supporto a "is_manodopera"
+# ------------------------------------------------------------------
+def import_materiali_csv(file):
+    import pandas as pd
+
+    # Riconosci estensione
+    fname = file.name.lower()
+    if fname.endswith(".csv"):
+        df = pd.read_csv(file)
+    elif fname.endswith(".xlsx"):
+        df = pd.read_excel(file)
+    else:
+        st.error("Formato non supportato (solo CSV o Excel).")
+        return
+
+    # Normalizza nomi colonne
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    # Controllo colonne obbligatorie
+    required = ["categoria","fornitore","codice_fornitore","descrizione","unita_misura","prezzo_unitario"]
+    for col in required:
+        if col not in df.columns:
+            st.error(f"Manca la colonna obbligatoria: {col}")
+            return
+
+    # Colonne opzionali
+    if "quantita_default" not in df.columns:
+        df["quantita_default"] = 1.0
+    if "is_manodopera" not in df.columns:
+        df["is_manodopera"] = 0
+
+    # Inserimento riga per riga
+    with get_con() as con:
+        for _, r in df.iterrows():
+            cat_id = ensure_categoria(con, str(r["categoria"]).strip())
+            forn_id = ensure_fornitore(con, str(r["fornitore"]).strip())
+            um = str(r["unita_misura"]).strip()
+
+            try:
+                _exec(con, """INSERT INTO materiali_base
+                              (categoria_id, fornitore_id, codice_fornitore, descrizione, unita_misura, quantita_default, prezzo_unitario, is_manodopera)
+                              VALUES (?,?,?,?,?,?,?,?)""",
+                      (cat_id, forn_id,
+                       str(r["codice_fornitore"]).strip(),
+                       str(r["descrizione"]).strip(),
+                       um,
+                       _to_float(r.get("quantita_default", 1.0), 1.0),
+                       _to_float(r["prezzo_unitario"], 0.0),
+                       int(bool(r.get("is_manodopera", 0)))))
+            except sqlite3.IntegrityError:
+                st.warning(f"Codice già presente: {r['codice_fornitore']} per fornitore {r['fornitore']}")
+        con.commit()
+
+    st.success(f"Importati {len(df)} materiali.")
+
 
 # ------------------------------------------------------------------
 # UI – Capitoli
@@ -1406,11 +1574,12 @@ def ui_voci():
                     st.rerun()
 
             tot = compute_totali_voce(int(voce_sel))
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Materie (€)", f"{tot['costo_materie']:.2f}")
-            m2.metric("Spese generali (€)", f"{tot['costi_generali']:.2f}", help=f"{tot['cg_pct']}%")
-            m3.metric("Utile (€)", f"{tot['utile']:.2f}", help=f"{tot['utile_pct']}%")
-            m4.metric("Totale voce (€)", f"{tot['totale']:.2f}")
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Materiali (€)", f"{tot['costo_materie']:.2f}")
+            m2.metric("Manodopera (€)", f"{tot['costo_manodopera']:.2f}")
+            m3.metric("Spese generali (€)", f"{tot['costi_generali']:.2f}", help=f"{tot['cg_pct']}% su diretto")
+            m4.metric("Utile (€)", f"{tot['utile']:.2f}", help=f"{tot['utile_pct']}% su (diretto+CG)")
+            m5.metric("Totale voce (€)", f"{tot['totale']:.2f}")
 
             # Scostamento % rispetto al prezzo di riferimento (se impostato)
             prezzo_rif_show = float(new_prezzo_rif) if new_prezzo_rif is not None else float(v.get("prezzo_rif", 0.0))
@@ -1439,8 +1608,8 @@ def ui_sommario():
     for _, r in voci.iterrows():
         tot = compute_totali_voce(int(r.id))
         rows.append({
-            "Capitolo": r.capitolo_codice,     # codice
-            "CapitoloNome": r.capitolo_nome,   # nome
+            "Capitolo": r.capitolo_codice,
+            "CapitoloNome": r.capitolo_nome,
             "Cod. Voce": r.codice,
             "Descrizione": r.descrizione,
             "UM Voce": r.um_voce,
@@ -1448,12 +1617,15 @@ def ui_sommario():
             "CG %": r.cg_pct,
             "Utile %": r.utile_pct,
             "Materie (€)": round(tot["costo_materie"], 2),
+            "Manodopera (€)": round(tot["costo_manodopera"], 2),
             "Spese generali (€)": round(tot["costi_generali"], 2),
             "Utile (€)": round(tot["utile"], 2),
             "Totale (€)": round(tot["totale"], 2),
             "voce_id": int(r.id),
         })
-    df_sum = pd.DataFrame(rows).sort_values(["Capitolo", "Cod. Voce"]).reset_index(drop=True)
+
+
+        df_sum = pd.DataFrame(rows).sort_values(["Capitolo", "Cod. Voce"]).reset_index(drop=True)
 
     # -----------------------------
     # Filtri "stile Excel"
@@ -1509,6 +1681,7 @@ def ui_sommario():
 
                     st.caption(
                         f"Materie € {r['Materie (€)']:.2f} | "
+                        f"Manodopera € {r['Manodopera (€)']:.2f} | "
                         f"Spese generali € {r['Spese generali (€)']:.2f} | "
                         f"Utile € {r['Utile (€)']:.2f}"
                     )
