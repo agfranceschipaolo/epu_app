@@ -1,28 +1,53 @@
-# EPU Builder v1.3.2 – Streamlit + SQLite
-# Correzioni incluse:
-# - RIMOSSI i blocchi duplicati "CREA NUOVA VOCE" e "ELENCO + DETTAGLIO VOCE" fuori dalle funzioni (causavano NameError su 'cap')
-# - PRAGMA foreign_keys=ON su ogni connessione
-# - Indici SQLite per performance
-# - ui_clienti(): CAP rinominato in cap_zip per evitare ombreggiamento con 'cap' (capitoli)
-# - import_materiali_csv(): parsing float robusto (virgole decimali)
-# - export_preventivo_docx(): gestione sicura campo 'note'
-# - Chiavi Streamlit già coerenti in ui_voci()
-# - NEW: CSS per rimuovere “fullscreen” su tabelle, utility testo/filtri, blocco duplicati fornitori,
-#        messaggio capitolo defaults aggiornato
+# EPU Builder v1.3.2 – Streamlit + SQLite/Postgres
 
 import io
 import re
-import sqlite3
+import sqlite3  # ancora usato in locale
 from contextlib import contextmanager
 from typing import Optional, Dict
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import create_engine, text
 
-DB_PATH = "epu.db"
+# -----------------------------
+# Configurazione base
+# -----------------------------
 UM_CHOICES = ["Mt", "Mtq2", "Hr", "Nr", "Lt", "GG", "KG", "QL", "AC"]
 
+DB_PATH = "epu.db"  # database locale SQLite
+
+# ⚠️ va chiamato subito
 st.set_page_config(page_title="EPU Builder v1.3.2", layout="wide")
+
+# -----------------------------
+# Connessione DB con SQLAlchemy
+# -----------------------------
+def get_engine():
+    if "DATABASE_URL" in st.secrets:
+        return create_engine(
+            st.secrets["DATABASE_URL"],
+            pool_pre_ping=True,
+            pool_recycle=1800,
+        )
+    elif "SQLITE_PATH" in st.secrets:
+        sqlite_url = f"sqlite:///{st.secrets['SQLITE_PATH']}"
+        return create_engine(sqlite_url)
+    else:
+        # fallback: usa il file locale se presente
+        sqlite_url = f"sqlite:///{DB_PATH}"
+        return create_engine(sqlite_url)
+
+# -----------------------------
+# Mostra ambiente in sidebar
+# -----------------------------
+env = st.secrets.get("ENV", "dev")
+with st.sidebar:
+    st.markdown(f"**Ambiente:** `{env}`")
+    if env == "prod":
+        st.warning("⚠️ PRODUZIONE")
+    else:
+        st.info("🧪 SVILUPPO (DEV)")
 
 # ------------------------------------------------------------------
 # CSS globale: rimuovi pulsante "View fullscreen" sui dataframe/editor
