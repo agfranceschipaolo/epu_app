@@ -10,70 +10,128 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 
-# -----------------------------
-# Configurazione base
-# -----------------------------
-import os
-from sqlalchemy import create_engine, event  # se NON usi SQLAlchemy, puoi rimuovere questa import
-import streamlit as st
+# -------------------------------------------------
+# Fix per errore "RuntimeError: Event loop is closed"
+# su Python 3.12/3.13 + Streamlit (Windows)
+# -------------------------------------------------
+import asyncio
+import sys
+import warnings
 
+try:
+    if sys.version_info >= (3, 12):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+except Exception:
+    pass
+
+# Opzionale: sopprime eventuali warning residui
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 UM_CHOICES = ["Mt", "Mtq2", "Hr", "Nr", "Lt", "GG", "KG", "QL", "AC"]
 
-# Risolvi il percorso DB in modo robusto: secrets -> env -> default
+# -------------------------
+# Config pagina: layout largo
+# -------------------------
+st.set_page_config(
+    page_title="EPU Builder v1.3.2",
+    page_icon="🏗️",
+    layout="wide",                    # <<— larghezza piena
+    initial_sidebar_state="expanded",
+)
+
+# =============  DB ADAPTER: SQLite (dev) <-> Postgres (prod)  =============
+import os
+import sqlite3
+from contextlib import contextmanager
+
+import pandas as pd
+import streamlit as st
+
+# psycopg2 per Postgres (in prod)
+try:
+    import psycopg2
+except Exception:
+    psycopg2 = None  # in locale/dev non è obbligatorio
+
+# --- Rilevamento ambiente/prod ---
+IS_PROD = bool(st.secrets.get("ENV", "dev") == "prod" and st.secrets.get("DATABASE_URL"))
+
+# --- Path SQLite (sviluppo) ---
 DB_PATH = (
-    st.secrets.get("SQLITE_PATH")
-    if hasattr(st, "secrets") else None
+    st.secrets.get("SQLITE_PATH") if hasattr(st, "secrets") else None
 ) or os.getenv("SQLITE_PATH") or "epu.db"
 
-# ⚠️ va chiamato subito
-st.set_page_config(page_title="EPU Builder v1.3.2", layout="wide")
+def _normalize_pg_url(url: str) -> str:
+    """Rende la URL utilizzabile da psycopg2 (toglie '+psycopg2' se presente)."""
+    return url.replace("postgresql+psycopg2://", "postgresql://", 1)
 
-
-# -----------------------------
-# Connessione DB (sqlite3) - usata da get_con()
-# -----------------------------
-# Il resto dell'app usa già sqlite3 via get_con() con DB_PATH,
-# quindi è sufficiente che DB_PATH sia risolto correttamente qui sopra.
-# Esempio (già presente altrove nel tuo codice):
-#
-# @contextmanager
-# def get_con():
-#     con = sqlite3.connect(DB_PATH)
-#     try:
-#         con.execute("PRAGMA foreign_keys = ON")
-#         yield con
-#     finally:
-#         con.close()
-
-
-# -----------------------------
-# (Opzionale) Connessione DB via SQLAlchemy
-# -----------------------------
-def get_engine():
+@contextmanager
+def get_con():
     """
-    Usa DATABASE_URL se presente nei secrets (es. Postgres),
-    altrimenti usa SQLite puntando al DB_PATH risolto sopra.
-    Imposta anche PRAGMA foreign_keys=ON su SQLite.
+    Connessione al DB:
+      - PROD  -> Postgres (Supabase) via psycopg2
+      - DEV   -> SQLite locale
     """
-    if hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
-        eng = create_engine(
-            st.secrets["DATABASE_URL"],
-            pool_pre_ping=True,
-            pool_recycle=1800,
-        )
+    if IS_PROD:
+        if psycopg2 is None:
+            raise RuntimeError("psycopg2 non disponibile: aggiungi 'psycopg2-binary' ai requirements.")
+        url = _normalize_pg_url(st.secrets["DATABASE_URL"])
+        con = psycopg2.connect(dsn=url)
+        try:
+            yield con
+        finally:
+            con.close()
     else:
-        sqlite_url = f"sqlite:///{DB_PATH}"
-        eng = create_engine(sqlite_url)
+        con = sqlite3.connect(DB_PATH)
+        try:
+            # Abilita FK su ogni connessione SQLite
+            con.execute("PRAGMA foreign_keys = ON")
+            yield con
+        finally:
+            con.close()
 
-    # Abilita FK su SQLite
-    if eng.url.get_backend_name() == "sqlite":
-        @event.listens_for(eng, "connect")
-        def set_sqlite_pragma(dbapi_connection, connection_record):
-            cursor = dbapi_connection.cursor()
-            cursor.execute("PRAGMA foreign_keys = ON")
-            cursor.close()
+def _translate_sql_for_prod(sql: str) -> str:
+    """
+    Piccole differenze sintattiche SQLite -> Postgres:
+      - IFNULL(x,y)          -> COALESCE(x,y)
+      - datetime('now')      -> NOW()
+      - placeholder '?'      -> '%s'
+    """
+    sql2 = sql
+    sql2 = sql2.replace("IFNULL(", "COALESCE(")
+    sql2 = sql2.replace("datetime('now')", "NOW()")
+    sql2 = sql2.replace('datetime("now")', "NOW()")
+    # placeholder (nel tuo SQL non usi '?' dentro stringhe letterali)
+    sql2 = sql2.replace("?", "%s")
+    return sql2
 
-    return eng
+def _exec(con, sql: str, params=None):
+    """
+    Esegue SQL parametrizzato con compatibilità Postgres/SQLite.
+    Usa:
+        _exec(con, "SELECT ... WHERE id = ?", (42,))
+    """
+    cur = con.cursor()
+    if IS_PROD:
+        sql = _translate_sql_for_prod(sql)
+    cur.execute(sql, params or [])
+    return cur
+
+# --- Patch di pandas.read_sql_query per tradurre SQL anche nelle SELECT ---
+_pd_read_sql_query_orig = pd.read_sql_query
+
+def _pd_read_sql_query_patched(sql, con, params=None, *args, **kwargs):
+    if IS_PROD:
+        sql = _translate_sql_for_prod(sql)
+    return _pd_read_sql_query_orig(sql, con, params=params, *args, **kwargs)
+
+pd.read_sql_query = _pd_read_sql_query_patched
+# ===========================================================================
+
+# (facoltativo) Badge in sidebar per vedere il driver attivo
+try:
+    st.sidebar.caption("DB driver: " + ("Postgres" if IS_PROD else f"SQLite ({DB_PATH})"))
+except Exception:
+    pass
 
 
 # -----------------------------
