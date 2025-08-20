@@ -140,6 +140,16 @@ def like_mask(series: pd.Series, needle: str) -> pd.Series:
         return pd.Series([True]*len(series))
     return series.fillna("").astype(str).str.contains(str(needle), case=False, regex=False)
 
+def flash_msg(key="delete_msg"):
+    """Mostra e consuma un messaggio 'flash' dalla sessione."""
+    msg = st.session_state.pop(key, None)  # lo consumo subito
+    if msg:
+        if msg.startswith("❌"):
+            st.error(msg, icon="🚫")
+        else:
+            st.success(msg, icon="✅")
+        # opzionale: toast che resta visibile un po’
+        st.toast(msg)
 # ------------------------------------------------------------------
 # DB init
 # ------------------------------------------------------------------
@@ -220,7 +230,16 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # già presente
 
-        # Righe distinta
+        # MIGRAZIONE: aggiunge la colonna descrizione_estesa se manca
+        try:
+            cur.execute(
+             "ALTER TABLE voci_analisi "
+            "ADD COLUMN descrizione_estesa TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # già presente
+
+         # Righe distinta
         cur.execute("""
         CREATE TABLE IF NOT EXISTS righe_distinta (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -331,7 +350,22 @@ def ensure_is_manodopera_column():
         if "is_manodopera" not in cols:
             _exec(con, "ALTER TABLE materiali_base ADD COLUMN is_manodopera INTEGER NOT NULL DEFAULT 0")
             con.commit()
-       
+def ensure_categoria(con, nome: str) -> int:
+    """Ritorna l'id categoria esistente o la crea e ritorna il nuovo id."""
+    row = _exec(con, "SELECT id FROM categorie WHERE nome=?", (nome,)).fetchone()
+    if row:
+        return int(row[0])
+    _exec(con, "INSERT INTO categorie (nome) VALUES (?)", (nome,))
+    return int(_exec(con, "SELECT last_insert_rowid()").fetchone()[0])
+
+def ensure_fornitore(con, nome: str) -> int:
+    """Ritorna l'id fornitore esistente o lo crea e ritorna il nuovo id."""
+    row = _exec(con, "SELECT id FROM fornitori WHERE nome=?", (nome,)).fetchone()
+    if row:
+        return int(row[0])
+    _exec(con, "INSERT INTO fornitori (nome) VALUES (?)", (nome,))
+    return int(_exec(con, "SELECT last_insert_rowid()").fetchone()[0])
+      
 
 # ------------------------------------------------------------------
 # Query helpers
@@ -435,7 +469,8 @@ def get_voce(voce_id: int) -> Optional[dict]:
                    IFNULL(v.utile_percentuale,0),
                    v.voce_unita_misura,
                    IFNULL(v.voce_quantita,1.0),
-                   IFNULL(v.prezzo_riferimento,0.0)
+                   IFNULL(v.prezzo_riferimento,0.0),
+                   IFNULL(v.descrizione_estesa,'')   -- 👈 virgola AGGIUNTA sopra
             FROM voci_analisi v
             JOIN capitoli c ON c.id = v.capitolo_id
             WHERE v.id = ?
@@ -449,6 +484,7 @@ def get_voce(voce_id: int) -> Optional[dict]:
             "cg_pct": float(row[6]), "utile_pct": float(row[7]),
             "um_voce": row[8], "q_voce": float(row[9]),
             "prezzo_rif": float(row[10]),
+            "descrizione_estesa": row[11],
         }
 
 # ------------------------------------------------------------------
@@ -571,6 +607,35 @@ def delete_categoria(cid: int):
         con.commit()
         st.success("Categoria eliminata.")
 
+# ------------------------------------------------------------------
+# UI – Categorie
+# ------------------------------------------------------------------
+def ui_categorie():
+    st.subheader("Categorie")
+    df = df_categorie()
+
+    left, right = st.columns([2, 1])
+
+    with left:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    with right:
+        nome = st.text_input("Nuova categoria")
+        if st.button("➕ Aggiungi categoria") and nome:
+            add_categoria(nome)
+            st.rerun()
+
+        if not df.empty:
+            del_id = st.selectbox(
+                "Elimina categoria",
+                options=[None] + df["id"].tolist(),
+                format_func=lambda x: "—" if x is None else df[df["id"] == x]["nome"].iloc[0],
+            )
+            if del_id and st.button("Elimina"):
+                delete_categoria(int(del_id))
+                st.rerun()
+
+
 def add_fornitore(nome, piva, indirizzo, email, telefono):
     """Inserisce un fornitore solo se NON esiste già per Nome (normalizzato) o P.IVA (solo cifre)."""
     nome_n = _norm_text(nome)
@@ -677,19 +742,34 @@ def delete_capitolo(cid: int):
         con.commit()
         st.success("Capitolo eliminato.")
 
-def add_voce(capitolo_id, codice, descrizione, cg_pct, utile_pct, um_voce, q_voce, prezzo_rif=0.0):
+def add_voce(capitolo_id, codice, descrizione, cg_pct, utile_pct, um_voce, q_voce,
+             prezzo_rif=0.0, descrizione_estesa: str = ""):
     try:
+        descr_est = (descrizione_estesa or "").strip()[:1000]  # max 1000 caratteri
+
         with get_con() as con:
-            _exec(con, """INSERT INTO voci_analisi
-                          (capitolo_id, codice, descrizione, costi_generali_percentuale, utile_percentuale,
-                           voce_unita_misura, voce_quantita, prezzo_riferimento)
-                          VALUES (?,?,?,?,?,?,?,?)""",
-                  (int(capitolo_id), codice.strip(), descrizione.strip(), float(cg_pct or 0.0),
-                   float(utile_pct or 0.0), um_voce, float(q_voce or 1.0), float(prezzo_rif or 0.0)))
+            _exec(con, """
+                INSERT INTO voci_analisi
+                (capitolo_id, codice, descrizione, descrizione_estesa,
+                 costi_generali_percentuale, utile_percentuale,
+                 voce_unita_misura, voce_quantita, prezzo_riferimento)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (
+                int(capitolo_id),
+                codice.strip(),
+                descrizione.strip(),
+                descr_est,
+                float(cg_pct or 0.0),
+                float(utile_pct or 0.0),
+                um_voce,
+                float(q_voce or 1.0),
+                float(prezzo_rif or 0.0),
+            ))
             con.commit()
             st.success("Voce creata.")
     except sqlite3.IntegrityError:
         st.error("Codice voce già esistente nel capitolo.")
+
 
 def update_voce_perc(vid: int, cg_pct: float, utile_pct: float):
     with get_con() as con:
@@ -737,11 +817,37 @@ def delete_riga(riga_id: int):
         st.success("Riga eliminata.")
 
 def delete_voce(vid: int):
+    """Impedisce l'eliminazione se la voce è utilizzata altrove."""
     with get_con() as con:
-        _exec(con, "DELETE FROM righe_distinta WHERE voce_analisi_id=?", (vid,))
-        _exec(con, "DELETE FROM voci_analisi WHERE id=?", (vid,))
+        used_distinta = _exec(
+            con, "SELECT COUNT(*) FROM righe_distinta WHERE voce_analisi_id=?",
+            (int(vid),)
+        ).fetchone()[0]
+        used_prev = _exec(
+            con, "SELECT COUNT(*) FROM preventivo_righe WHERE voce_id=?",
+            (int(vid),)
+        ).fetchone()[0]
+
+        if used_distinta or used_prev:
+            msg = []
+            if used_distinta:
+                msg.append(f"distinte ({used_distinta})")
+            if used_prev:
+                msg.append(f"preventivi ({used_prev})")
+
+            st.session_state["delete_msg"] = (
+                "❌ Impossibile eliminare la voce: è ancora utilizzata in "
+                + " e ".join(msg)
+                + ". Rimuovi prima i riferimenti."
+            )
+            st.rerun()   # ⬅️ forza il refresh DOPO aver scritto il messaggio
+            return
+
+        _exec(con, "DELETE FROM voci_analisi WHERE id=?", (int(vid),))
         con.commit()
-        st.success("Voce eliminata.")
+        st.session_state["delete_msg"] = "✅ Voce eliminata correttamente."
+        st.rerun()   # ⬅️ idem in caso di successo
+
 
 def clone_voce(vid: int):
     v = get_voce(vid)
@@ -957,9 +1063,13 @@ def df_preventivo(pid: int):
             WHERE p.id = ?
         """, con, params=[pid])
         righe = pd.read_sql_query("""
-            SELECT r.id, r.preventivo_id, r.capitolo_id, cap.codice AS capitolo_codice, cap.nome AS capitolo_nome,
-                   r.voce_id, v.codice AS voce_codice,
-                   r.descrizione, r.note, r.um, r.quantita, r.prezzo_unitario, r.prezzo_totale
+            SELECT
+                r.id, r.preventivo_id, r.capitolo_id,
+                cap.codice AS capitolo_codice, cap.nome AS capitolo_nome,
+                r.voce_id, v.codice AS voce_codice,
+                r.descrizione,                      -- descrizione SALVATA nella riga (quella "base")
+                v.descrizione_estesa AS voce_descrizione_estesa,  -- <- AGGIUNTO (per la stampa)
+                r.note, r.um, r.quantita, r.prezzo_unitario, r.prezzo_totale
             FROM preventivo_righe r
             JOIN capitoli cap ON cap.id = r.capitolo_id
             JOIN voci_analisi v ON v.id = r.voce_id
@@ -1019,6 +1129,25 @@ def df_preventivi_archivio(numero_like: str = "", data_like: str = "", cliente_i
             q += " AND p.cliente_id = ?"; params.append(int(cliente_id))
         q += " ORDER BY p.data DESC, p.numero DESC"
         return pd.read_sql_query(q, con, params=params)
+def delete_preventivo(pid: int):
+    """Elimina il preventivo e tutte le sue righe collegate."""
+    with get_con() as con:
+        r = _exec(con, "SELECT numero FROM preventivi WHERE id=?", (int(pid),)).fetchone()
+        if not r:
+            st.warning("Preventivo non trovato (forse già eliminato).")
+            return
+        numero = r[0]
+
+        # Prima righe, poi testata (non usiamo ON DELETE CASCADE)
+        _exec(con, "DELETE FROM preventivo_righe WHERE preventivo_id=?", (int(pid),))
+        _exec(con, "DELETE FROM preventivi WHERE id=?", (int(pid),))
+        con.commit()
+
+    # Pulisci eventuali selezioni nella sessione
+    st.session_state.pop("opened_preventivo_from_archivio", None)
+    st.session_state.pop("preventivo_corrente", None)
+    st.success(f"Preventivo {numero} (ID {pid}) eliminato.")
+
 
 def export_preventivo_docx(pid: int):
     # Import sicuro: se manca python-docx, non bloccare l’app
@@ -1077,8 +1206,13 @@ def export_preventivo_docx(pid: int):
         for _, r in righe.iterrows():
             row = table.add_row().cells
             row[0].text = f"{r.get('capitolo_codice','')} {r.get('capitolo_nome','')}"
-            row[1].text = str(r.get("voce_codice",""))
-            row[2].text = str(r.get("descrizione",""))
+            row[1].text = str(r.get("voce_codice","")) 
+            
+            # Descrizione base + descrizione estesa
+            desc_base = str(r.get("descrizione", "") or "")
+            desc_ext  = str(r.get("voce_descrizione_estesa", "") or "")
+            descr_full = desc_base + (" – " + desc_ext if desc_ext.strip() else "")
+            row[2].text = descr_full
             row[3].text = str(r.get("um",""))
             row[4].text = f"{float(r.get('quantita',0.0)):.2f}"
             row[5].text = f"{float(r.get('prezzo_unitario',0.0)):.2f}"
@@ -1399,6 +1533,11 @@ def ui_voci():
         st.info("Aggiungi almeno un materiale nell'Archivio.")
         return
 
+    # Mostra eventuale messaggio persistente
+    _msg = st.session_state.get("delete_msg")
+    if _msg:
+        (st.error if _msg.startswith("❌") else st.success)(_msg)
+         
     # -----------------------------
     # FORM: creazione nuova voce
     # -----------------------------
@@ -1434,6 +1573,12 @@ def ui_voci():
                                     help="Calcolato su (materie + spese generali).")
         um_voce = c2.selectbox("UM della VOCE (misura prodotta)", UM_CHOICES)
         q_voce = c2.number_input("Quantità della VOCE (misura prodotta)", min_value=0.0, value=1.0, step=0.1)
+        descrizione_estesa = c2.text_area(
+        "Descrizione estesa voce (max 1000 caratteri)",
+        max_chars=1000,
+        height=60,
+        placeholder="Inserisci una descrizione aggiuntiva della voce"
+        )
 
         # Prezzo di riferimento (facoltativo)
         prezzo_rif = c1.number_input("Prezzo di riferimento (facolt.)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
@@ -1442,7 +1587,7 @@ def ui_voci():
             if not (codice and descrizione and um_voce and q_voce > 0):
                 st.warning("Compila codice, descrizione, UM voce e quantità voce (>0).")
             else:
-                add_voce(capitolo_id, codice, descrizione, cg_pct, utile_pct, um_voce, q_voce, prezzo_rif)
+                add_voce(capitolo_id, codice, descrizione, cg_pct, utile_pct, um_voce, q_voce, prezzo_rif, descrizione_estesa)
                 st.rerun()
 
     # -----------------------------
@@ -1499,7 +1644,7 @@ def ui_voci():
         colA, colB, _ = st.columns(3)
         if voce_sel and colA.button("🗑️ Elimina voce"):
             delete_voce(int(voce_sel))
-            st.rerun()
+            
         if voce_sel and colB.button("🧬 Duplica voce"):
             clone_voce(int(voce_sel))
             st.rerun()
@@ -1627,8 +1772,7 @@ def ui_sommario():
             "voce_id": int(r.id),
         })
 
-
-        df_sum = pd.DataFrame(rows).sort_values(["Capitolo", "Cod. Voce"]).reset_index(drop=True)
+    df_sum = pd.DataFrame(rows).sort_values(["Capitolo", "Cod. Voce"]).reset_index(drop=True)
 
     # -----------------------------
     # Filtri "stile Excel"
@@ -1968,13 +2112,36 @@ def ui_preventivi():
             st.divider()
             render_preventivo_view(int(pid_show))
 
+    # --- Danger zone: elimina preventivo selezionato ---
+    with st.expander("🗑️ Elimina definitivamente questo preventivo", expanded=False):
+        st.markdown(
+            ":warning: **Operazione irreversibile.** "
+            "Verranno cancellate anche tutte le righe collegate."
+        )
+        colc1, colc2 = st.columns([1, 2])
+        conferma = colc1.checkbox("Confermo", value=False, key=f"del_conf_{pid_show}")
+        testo = colc2.text_input("Scrivi ELIMINA per confermare", key=f"del_txt_{pid_show}")
+
+        btn_del = st.button("Elimina preventivo", key=f"del_btn_{pid_show}")
+        if btn_del:
+            if not conferma or testo.strip().upper() != "ELIMINA":
+                st.error("Conferma mancante: spunta la checkbox e scrivi **ELIMINA**.")
+            else:
+                delete_preventivo(int(pid_show))
+                st.rerun()
+        
+        
+     
 # ------------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------------
 def main():
     init_db()
+    ensure_is_manodopera_column() 
     st.title("🏗️ EPU Builder v1.3.2")
     st.caption("Analisi voci (CG%/Utile% capitolo), distinte, Sommario EPU, preventivi con export Excel/Word.")
+
+    flash_msg("delete_msg")
 
     pagina = st.sidebar.radio("Navigazione", [
         "Categorie", "Fornitori", "Archivio materiali", "Capitoli", "Voci di analisi", "Sommario EPU", "Preventivi"

@@ -1,8 +1,10 @@
 @echo off
 REM =====================================================
-REM  Script per fare commit + push automatico su GitHub
-REM  Rileva automaticamente il branch corrente
+REM  Commit + Push automatico su GitHub (branch corrente)
 REM =====================================================
+
+:: Vai nella cartella del repo
+cd /d "C:\Users\francpao\Desktop\Programmi code\epu_app"
 
 :: Chiede messaggio di commit
 set /p msg=Inserisci messaggio commit: 
@@ -13,8 +15,8 @@ git add .
 :: Crea il commit
 git commit -m "%msg%"
 
-:: Recupera il branch corrente
-for /f "tokens=*" %%i in ('git rev-parse --abbrev-ref HEAD') do set branch=%%i
+:: Recupera il branch corrente (in modo semplice)
+for /f %%i in ('git symbolic-ref --short HEAD') do set branch=%%i
 
 echo Branch corrente: %branch%
 

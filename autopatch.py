@@ -231,7 +231,13 @@ def replace_docx_function(text):
         row = table.add_row().cells
         row[0].text = f"{r['capitolo_codice']} {r['capitolo_nome']}"
         row[1].text = str(r["voce_codice"])
-        row[2].text = str(r["descrizione"])
+
+        # Descrizione base (dalla riga) + estesa (dalla voce), SOLO in stampa
+        desc_base = str(r.get("descrizione", "") or "")
+        desc_ext  = str(r.get("voce_descrizione_estesa", "") or "")
+        descr_full = desc_base + (" – " + desc_ext if desc_ext.strip() else "")
+        
+        row[2].text = descr_full
         row[3].text = str(r["um"])
         row[4].text = f"{r['quantita']:.2f}"
         row[5].text = f"{r['prezzo_unitario']:.2f}"
