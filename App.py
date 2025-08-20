@@ -1021,25 +1021,41 @@ def df_preventivi_archivio(numero_like: str = "", data_like: str = "", cliente_i
         return pd.read_sql_query(q, con, params=params)
 
 def export_preventivo_docx(pid: int):
+    # Import sicuro: se manca python-docx, non bloccare l’app
     try:
         from docx import Document
         from docx.shared import Pt, Cm
     except ModuleNotFoundError:
-        # Modulo non presente: avvisa e disabilita l'export DOCX
         st.warning("Export DOCX non disponibile: installa il pacchetto 'python-docx' (requirements.txt).")
         return None
 
+    # Recupera testata e righe del preventivo
+    testa, righe = df_preventivo(pid)
+    if testa is None or testa.empty:
+        st.warning("Preventivo non trovato o senza testata.")
+        return None
+
+    # helper per leggere valori in modo sicuro
+    def _val(df, col, default=""):
+        try:
+            v = df[col].iloc[0]
+            return v if (pd.notna(v) and str(v).strip()) else default
+        except Exception:
+            return default
+
+    numero = _val(testa, "numero", "-")
+    data   = _val(testa, "data", "-")
     d = Document()
-    d.add_heading(f"Preventivo {testa['numero'].iloc[0]} del {testa['data'].iloc[0]}", level=1)
+    d.add_heading(f"Preventivo {numero} del {data}", level=1)
 
     # Cliente
     cli = [
-        f"Cliente: {testa['cliente_nome'].iloc[0]}",
-        f"P.IVA/CF: {testa['piva'].iloc[0] or '-'}",
-        f"Indirizzo: {testa['indirizzo'].iloc[0] or '-'}",
-        f"Città: {testa['cap'].iloc[0] or ''} {testa['citta'].iloc[0] or ''} ({testa['provincia'].iloc[0] or ''})",
-        f"Nazione: {testa['nazione'].iloc[0] or '-'}",
-        f"Email: {testa['email'].iloc[0] or '-'}  Tel: {testa['telefono'].iloc[0] or '-'}",
+        f"Cliente: {_val(testa,'cliente_nome','-')}",
+        f"P.IVA/CF: {_val(testa,'piva','-')}",
+        f"Indirizzo: {_val(testa,'indirizzo','-')}",
+        f"Città: {_val(testa,'cap','')} {_val(testa,'citta','')} ({_val(testa,'provincia','')})",
+        f"Nazione: {_val(testa,'nazione','-')}",
+        f"Email: {_val(testa,'email','-')}  Tel: {_val(testa,'telefono','-')}",
     ]
     for r in cli:
         d.add_paragraph(r)
@@ -1057,69 +1073,56 @@ def export_preventivo_docx(pid: int):
     hdr[5].text = "Prezzo U (€)"
     hdr[6].text = "Totale (€)"
 
-    for _, r in righe.iterrows():
-        row = table.add_row().cells
-        row[0].text = f"{r['capitolo_codice']} {r['capitolo_nome']}"
-        row[1].text = str(r["voce_codice"])
-        row[2].text = str(r["descrizione"])
-        row[3].text = str(r["um"])
-        row[4].text = f"{r['quantita']:.2f}"
-        row[5].text = f"{r['prezzo_unitario']:.2f}"
-        row[6].text = f"{r['prezzo_totale']:.2f}"
+    if righe is not None and not righe.empty:
+        for _, r in righe.iterrows():
+            row = table.add_row().cells
+            row[0].text = f"{r.get('capitolo_codice','')} {r.get('capitolo_nome','')}"
+            row[1].text = str(r.get("voce_codice",""))
+            row[2].text = str(r.get("descrizione",""))
+            row[3].text = str(r.get("um",""))
+            row[4].text = f"{float(r.get('quantita',0.0)):.2f}"
+            row[5].text = f"{float(r.get('prezzo_unitario',0.0)):.2f}"
+            row[6].text = f"{float(r.get('prezzo_totale',0.0)):.2f}"
 
-        note_val = r["note"] if "note" in r and pd.notna(r["note"]) and str(r["note"]).strip() else ""
-        if note_val:
-            d.add_paragraph(f"Note: {note_val}")
+            note_val = r.get("note", "")
+            if pd.notna(note_val) and str(note_val).strip():
+                d.add_paragraph(f"Note: {note_val}")
+    else:
+        d.add_paragraph("Nessuna riga nel preventivo.")
 
     d.add_paragraph("")
 
     # Totali per capitolo
-    if not righe.empty:
-        bycap = (righe.groupby(["capitolo_codice","capitolo_nome"])["prezzo_totale"].sum()
-                 .reset_index().rename(columns={"prezzo_totale":"Totale capitolo (€)"}))
+    if righe is not None and not righe.empty:
+        bycap = (
+            righe.groupby(["capitolo_codice","capitolo_nome"])["prezzo_totale"]
+            .sum().reset_index().rename(columns={"prezzo_totale":"Totale capitolo (€)"})
+        )
         d.add_paragraph("Totali per capitolo:")
         for _, rr in bycap.iterrows():
-            d.add_paragraph(f"- {rr['capitolo_codice']} {rr['capitolo_nome']}: € {rr['Totale capitolo (€)']:.2f}")
+            d.add_paragraph(f"- {rr['capitolo_codice']} {rr['capitolo_nome']}: € {float(rr['Totale capitolo (€)']):.2f}")
 
     d.add_paragraph("")
 
     # Riepilogo documento
-    imp = float(testa["imponibile"].iloc[0])
-    iva_p = float(testa["iva_percentuale"].iloc[0])
-    iva_imp = float(testa["iva_importo"].iloc[0])
-    tot = float(testa["totale"].iloc[0])
+    imp   = float(_val(testa, "imponibile", 0.0) or 0.0)
+    iva_p = float(_val(testa, "iva_percentuale", 22.0) or 0.0)
+    iva_imp = float(_val(testa, "iva_importo", 0.0) or 0.0)
+    tot   = float(_val(testa, "totale", 0.0) or 0.0)
 
     d.add_paragraph(f"Imponibile: € {imp:.2f}")
     d.add_paragraph(f"IVA {iva_p:.0f}%: € {iva_imp:.2f}")
     d.add_paragraph(f"Totale documento: € {tot:.2f}")
 
-    if testa["note_finali"].iloc[0]:
+    note_finali = _val(testa, "note_finali", "")
+    if str(note_finali).strip():
         d.add_paragraph("")
-        d.add_paragraph(f"Note finali: {testa['note_finali'].iloc[0]}")
+        d.add_paragraph(f"Note finali: {note_finali}")
 
     buf = io.BytesIO()
     d.save(buf)
     buf.seek(0)
     return buf
-
-# ------------------------------------------------------------------
-# UI – Categorie
-# ------------------------------------------------------------------
-def ui_categorie():
-    st.subheader("Categorie")
-    df = df_categorie()
-    left, right = st.columns([2, 1])
-    with left:
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    with right:
-        nome = st.text_input("Nuova categoria")
-        if st.button("➕ Aggiungi categoria") and nome:
-            add_categoria(nome); st.rerun()
-        if not df.empty:
-            del_id = st.selectbox("Elimina categoria", options=[None]+df["id"].tolist(),
-                                  format_func=lambda x: "—" if x is None else df[df["id"]==x]["nome"].iloc[0])
-            if del_id and st.button("Elimina"):
-                delete_categoria(int(del_id)); st.rerun()
 
 # ------------------------------------------------------------------
 # UI – Fornitori
